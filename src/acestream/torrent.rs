@@ -4,19 +4,19 @@ use serde::{Serialize, Deserialize};
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct Torrent {
     #[serde(skip)]
-    player_id: String,
+    pub player_id: String,
     #[serde(skip)]
-    infohash: String,
+    pub infohash: String,
     #[serde(skip)]
-    encrypted_sha1: String,
+    pub encrypted_sha1: String,
 
-    name: String,
-    piece_length: usize,
-    chunk_length: usize,
-    bitrate: usize,
-    authmethod: String,
-    quality: String,
-    trackers: Vec<String>,
-    //pubkey: Vec<u8>,
-    categories: Vec<String>,
+    pub name: String,
+    pub piece_length: usize,
+    pub chunk_length: usize,
+    pub bitrate: usize,
+    pub authmethod: String,
+    pub quality: String,
+    pub trackers: Vec<String>,
+    //pub pubkey: Vec<u8>,
+    pub categories: Vec<String>,
 }

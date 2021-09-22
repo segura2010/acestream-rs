@@ -28,7 +28,7 @@ async fn do_get(path: String, params: String) -> Result<reqwest::Response, Strin
 }
 
 fn sign_request(params: String) -> String {
-    let mut params_transform = format!("{}{}", params.replace("&", "#"), SIGN_SALT);
+    let params_transform = format!("{}{}", params.replace("&", "#"), SIGN_SALT);
     let mut hasher = Sha1::new();
     hasher.update(params_transform.as_bytes());
     let hash_bytes = hasher.finalize();
@@ -63,4 +63,30 @@ pub async fn get_torrent(player_id: String) -> Result<GetTorrentResponse, String
     }
 }
 
-// TODO: rest of methods: checktorrent
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct CheckTorrentResponse {
+    pub id: String, // player_id
+    pub infohash: String,
+}
+pub async fn check_torrent(torrent_hash: String) -> Result<CheckTorrentResponse, String> {
+    let params = format!("_n={}&_p=win32&_r=128687276&_v={}&a=0&checksum={}&d=0&z=0", VERSION, VERSION_CODE, torrent_hash);
+    let response = do_get("/checktorrent".to_string(), params.to_string()).await;
+    match response {
+        Ok(r) => {
+            match r.text().await {
+                Ok(body) => {
+                    //println!("{}", body);
+                    match from_str::<CheckTorrentResponse>(&body) {
+                        Ok(mut t) => {
+                            t.infohash = hex::encode(base64::decode(t.infohash).unwrap());
+                            return Ok(t)
+                        },
+                        Err(e) => { return Err(format!("error_http_body_xml:{}", e)) }
+                    }
+                },
+                Err(e) => { return Err(format!("error_http_body:{}", e)) }
+            }
+        },
+        Err(e) => { return Err(e) },
+    }
+}
