@@ -17,6 +17,7 @@ dependencies = [
  "resolve",
  "serde",
  "serde-xml-rs",
+ "serde_bytes",
  "sha-1",
  "tokio",
 ]

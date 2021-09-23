@@ -2,6 +2,7 @@
 mod crypto;
 mod acestream;
 mod utils;
+mod bittorrent;
 
 use clap::{App, Arg};
 
@@ -44,6 +45,22 @@ async fn main() {
             }
         }
     } else {
+        // TODO: remove code here; used for testing..
+
+        let mut dht_manager = bittorrent::dht::DHTManager{
+            routers: vec![
+                utils::create_dht_router_addr("router.bittorrent.com", 6881, true).unwrap(),
+                utils::create_dht_router_addr("46.242.8.198", 10046, false).unwrap(),
+            ],
+            socket: None,
+        };
+        dht_manager.listen("0.0.0.0:1337".to_string());
+        dht_manager.get_peers(&hex::decode("3c3819026afa33aed0108baba4e6e9e9f57834f0").unwrap());
+        loop {
+            dht_manager.recv_peers();
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+        }
+
         panic!("ERROR: Provide torrent or player ID!");
     }
 
