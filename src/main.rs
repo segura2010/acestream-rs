@@ -1,6 +1,7 @@
 
 mod crypto;
 mod acestream;
+mod utils;
 
 use clap::{App, Arg};
 
@@ -50,5 +51,9 @@ async fn main() {
     if let Some(t) = torrent {
         println!("{:#?}", t);
         // TODO: look for peers, downlaod, play :)
+        // the following code must be moved to a class; it is just a test
+        if let Ok(router) = utils::create_dht_router_addr("router.bittorrent.com", 6881, true) {
+            println!("{:?}", router);
+        }
     }
 }
