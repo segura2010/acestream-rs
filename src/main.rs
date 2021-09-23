@@ -52,6 +52,7 @@ async fn main() {
         println!("{:#?}", t);
         // TODO: look for peers, downlaod, play :)
         // the following code must be moved to a class; it is just a test
+        // communication with trackers, some example code: https://github.com/mandreyel/cratetorrent/blob/master/cratetorrent/src/tracker.rs
         if let Ok(router) = utils::create_dht_router_addr("router.bittorrent.com", 6881, true) {
             println!("{:?}", router);
         }
