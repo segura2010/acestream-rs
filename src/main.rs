@@ -45,19 +45,6 @@ async fn main() {
             }
         }
     } else {
-        // TODO: remove code here; used for testing..
-
-        let mut dht_manager = bittorrent::dht::new_default();
-        dht_manager.listen("0.0.0.0:1337".to_string());
-        let ihash = hex::decode("4fcc50395f0f4a26af71d82fe8401559c6a4871f").unwrap();
-        dht_manager.get_peers(&ihash);
-        loop {
-            println!("receiving..");
-            dht_manager.recv_peers();
-            std::thread::sleep(std::time::Duration::from_millis(1000));
-            dht_manager.get_peers(&ihash);
-        }
-
         panic!("ERROR: Provide torrent or player ID!");
     }
 
@@ -67,8 +54,7 @@ async fn main() {
         // TODO: look for peers, downlaod, play :)
         // the following code must be moved to a class; it is just a test
         // communication with trackers, some example code: https://github.com/mandreyel/cratetorrent/blob/master/cratetorrent/src/tracker.rs
-        if let Ok(router) = utils::create_dht_router_addr("router.bittorrent.com", 6881, true) {
-            println!("{:?}", router);
-        }
+        let mut bt_client = acestream::bittorrent::new_client(t);
+        bt_client.start();
     }
 }

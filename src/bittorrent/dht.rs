@@ -2,6 +2,7 @@
 use crate::utils;
 
 use std::net::{ToSocketAddrs, SocketAddr};
+use std::collections::hash_set::HashSet;
 
 use serde::{Serialize, Deserialize};
 use serde_bencode::de::from_bytes;
@@ -29,13 +30,13 @@ pub struct GetPeersRequest {
     pub y: String, // message type
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Node {
     pub id: [u8; 20],
     pub ip: [u8; 4],
     pub port: u16,
 }
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Peer {
     pub ip: [u8; 4],
     pub port: u16,
@@ -111,24 +112,44 @@ impl GetPeersRequest {
     }
 }
 
+fn new_getpeersrequest(tid: i32, infohash: Vec<u8>) -> GetPeersRequest {
+    GetPeersRequest{
+        q: "get_peers".to_string(),
+        t: tid,
+        y: "q".to_string(),
+        a: GetPeersRequestTrasaction{
+            id: infohash.as_slice().to_vec(), // TODO: should be some random 20 bytes slice..
+            info_hash: infohash.as_slice().to_vec(),
+            want: vec!["n4".to_string()] // nodes IPv6, "n6".to_string()], 
+        },
+    }
+}
+
 #[derive(Debug)]
 pub struct DHTManager {
+    pub infohash: Vec<u8>,
     pub routers: Vec<std::net::SocketAddr>,
-    pub nodes: Vec<Node>,
-    pub peers: Vec<Peer>,
+    pub nodes: HashSet<Node>,
+    pub peers: HashSet<Peer>,
 
     pub socket: Option<std::net::UdpSocket>,
 }
 
 pub fn new_default() -> DHTManager {
+    let mut routers = Vec::with_capacity(20);
+    routers.append(&mut utils::create_dht_router_addr("router.bittorrent.com", 6881, true).unwrap());
+    routers.append(&mut utils::create_dht_router_addr("router.utorrent.com", 6881, true).unwrap());
+    routers.append(&mut utils::create_dht_router_addr("tracker.coppersurfer.tk", 6969, true).unwrap());
+    routers.append(&mut utils::create_dht_router_addr("dht.transmissionbt.com", 6881, true).unwrap());
+    routers.append(&mut utils::create_dht_router_addr("dht.aelitis.com", 6881, true).unwrap());
+    routers.append(&mut utils::create_dht_router_addr("router.silotis.us", 6881, true).unwrap());
+    routers.append(&mut utils::create_dht_router_addr("dht.libtorrent.org", 25401, true).unwrap());
+
     DHTManager{
-        routers: vec![
-            utils::create_dht_router_addr("router.bittorrent.com", 6881, true).unwrap(),
-            utils::create_dht_router_addr("tracker.coppersurfer.tk", 6969, true).unwrap(),
-            utils::create_dht_router_addr("dht.transmissionbt.com", 6881, true).unwrap(),
-        ],
-        nodes: Vec::<Node>::with_capacity(100),
-        peers: Vec::<Peer>::with_capacity(200),
+        infohash: vec![],
+        routers: routers,
+        nodes: HashSet::<Node>::with_capacity(100),
+        peers: HashSet::<Peer>::with_capacity(200),
         socket: None,
     }
 }
@@ -137,6 +158,8 @@ impl DHTManager {
     pub fn listen(&mut self, binding: String) -> Result<u8, String> {
         match std::net::UdpSocket::bind(binding) {
             Ok(s) => {
+                s.set_read_timeout(Some(std::time::Duration::from_millis(5000)));
+                s.set_write_timeout(Some(std::time::Duration::from_millis(1000)));
                 self.socket = Some(s);
                 return Ok(0);
             }
@@ -149,16 +172,7 @@ impl DHTManager {
     // TODO: should return channel to receive an updated list of peers.. ?
     pub fn get_peers(&self, infohash: &[u8]) {
         if let Some(socket) = &self.socket {
-            let msg = GetPeersRequest{
-                q: "get_peers".to_string(),
-                t: 1,
-                y: "q".to_string(),
-                a: GetPeersRequestTrasaction{
-                    id: infohash.to_vec(), // TODO: should be some random 20 bytes slice..
-                    info_hash: infohash.to_vec(),
-                    want: vec!["n4".to_string()] // nodes IPv6, "n6".to_string()], 
-                },
-            };
+            let msg = new_getpeersrequest(1, infohash.to_vec());
 
             for r in self.routers.iter(){
                 socket.send_to(&msg.to_bencode().unwrap(), r);
@@ -170,29 +184,49 @@ impl DHTManager {
         }
     }
 
-    pub fn recv_peers(&mut self) {
+    pub fn recv_peers(&mut self) -> Result<(), String> {
         if let Some(socket) = &self.socket {
             let mut buff = [0u8; 2048];
             if let Ok((n, src)) = socket.recv_from(&mut buff) {
                 //println!("{}, {:?}: {:?}", n, src, buff);
                 match from_bytes::<DHTResponse>(&buff[..n]) {
                     Ok(resp) => {
-                        println!("{:?}", resp);
-                        if self.nodes.len() < 100 {
-                            for n in resp.get_nodes() {
-                                self.nodes.push(n);
+                        //println!("{:?}", resp);
+                        for n in resp.get_nodes() {
+                            let ip = n.ip;
+                            let port = n.port;
+                            let inserted = self.nodes.insert(n);
+                            if inserted {
+                                // query new nodes :)
+                                let msg = new_getpeersrequest(1, self.infohash.as_slice().to_vec());
+                                socket.send_to(&msg.to_bencode().unwrap(), SocketAddr::from((ip, port)));
                             }
                         }
                         for p in resp.get_peers() {
-                            self.peers.push(p);
+                            self.peers.insert(p);
                         }
-
-                        println!("{:?}", self);
+                        //println!("{:?}", self);
+                        return Ok(());
                     },
                     Err(e) => {
                         println!("ERROR: {}", e);
+                        return Err(e.to_string());
                     },
                 }
+            }
+        }
+        Err("nothing received".to_string())
+    }
+
+    pub fn get_peers_forever(&mut self, infohash: &[u8]) {
+        loop{
+            let recv_res = self.recv_peers();
+            println!("{:?}", recv_res);
+            if let Err(e) = recv_res {
+                //self.get_peers(&infohash);
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5000));
             }
         }
     }
