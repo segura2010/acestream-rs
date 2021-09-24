@@ -11,8 +11,16 @@ pub fn create_dht_router_addr(host: &str, port: usize, resolve: bool) -> Result<
         let dns_resolver = DnsResolver::new(dns_resolver_config).unwrap();
         match dns_resolver.resolve_host(host) {
             Ok(ip_addrs) => {
-                // if there are multiple IPs just take one of them
-                let ip = ip_addrs.last().unwrap().to_string();
+                // if there are multiple IPs just take one of them -> NO
+                // TODO: we need all of them!!
+                let ip: String = {
+                    let mut rip = "".to_string();
+                    for ip in ip_addrs {
+                        rip = ip.to_string();
+                        break;
+                    }
+                    rip
+                };
                 let ip_port = format!("{}:{}", ip, port);
                 let dht_router = std::net::SocketAddr::V4(ip_port.parse().unwrap());
                 return Ok(dht_router);

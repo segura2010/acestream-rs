@@ -1,5 +1,6 @@
 
 use serde::{Serialize, Deserialize};
+use serde_bytes::ByteBuf;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct Torrent {
@@ -17,6 +18,6 @@ pub struct Torrent {
     pub authmethod: String,
     pub quality: String,
     pub trackers: Vec<String>,
-    //pub pubkey: Vec<u8>,
+    pub pubkey: Option<ByteBuf>,
     pub categories: Vec<String>,
 }

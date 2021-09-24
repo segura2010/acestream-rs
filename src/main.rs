@@ -47,18 +47,15 @@ async fn main() {
     } else {
         // TODO: remove code here; used for testing..
 
-        let mut dht_manager = bittorrent::dht::DHTManager{
-            routers: vec![
-                utils::create_dht_router_addr("router.bittorrent.com", 6881, true).unwrap(),
-                utils::create_dht_router_addr("46.242.8.198", 10046, false).unwrap(),
-            ],
-            socket: None,
-        };
+        let mut dht_manager = bittorrent::dht::new_default();
         dht_manager.listen("0.0.0.0:1337".to_string());
-        dht_manager.get_peers(&hex::decode("3c3819026afa33aed0108baba4e6e9e9f57834f0").unwrap());
+        let ihash = hex::decode("4fcc50395f0f4a26af71d82fe8401559c6a4871f").unwrap();
+        dht_manager.get_peers(&ihash);
         loop {
+            println!("receiving..");
             dht_manager.recv_peers();
             std::thread::sleep(std::time::Duration::from_millis(1000));
+            dht_manager.get_peers(&ihash);
         }
 
         panic!("ERROR: Provide torrent or player ID!");

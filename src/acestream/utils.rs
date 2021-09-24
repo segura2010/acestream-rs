@@ -5,7 +5,7 @@ use crate::acestream::torrent;
 use crate::acestream::api;
 
 use sha1::{Sha1, Digest};
-use bendy::serde::{from_bytes, to_bytes};
+use serde_bencode::de::from_bytes;
 
 pub async fn torrent_from_encrypted_torrent(enc_torrent: &[u8]) -> Result<torrent::Torrent, String> {
     let cipher = EncryptorAES::new_cbc(crypto::AES_KEY, crypto::AES_IV);

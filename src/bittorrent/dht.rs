@@ -1,7 +1,15 @@
 
+use crate::utils;
+
+use std::net::{ToSocketAddrs, SocketAddr};
+
 use serde::{Serialize, Deserialize};
-use bendy::serde::{from_bytes, to_bytes};
+use serde_bencode::de::from_bytes;
+use serde_bencode::ser::to_bytes;
 use serde_bytes::ByteBuf;
+
+use std::io::{Write, Read, Cursor};
+use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetPeersRequestTrasaction {
@@ -21,35 +29,76 @@ pub struct GetPeersRequest {
     pub y: String, // message type
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Node { //(Vec<u8>, i64);
-    #[serde(with = "serde_bytes")]
-    pub id: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    pub ip: Vec<u8>,
+#[derive(Debug)]
+pub struct Node {
+    pub id: [u8; 20],
+    pub ip: [u8; 4],
+    pub port: u16,
+}
+#[derive(Debug)]
+pub struct Peer {
+    pub ip: [u8; 4],
     pub port: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DHTResponseResponse {
-    #[serde(with = "serde_bytes")]
-    pub id: Vec<u8>,
-    //#[serde(with = "serde_bytes")]
-    //pub nodes: Option<Vec<u8>>,
-    //#[serde(with = "serde_bytes")]
-    //pub values: Option<Vec<u8>>, // peers
-    #[serde(with = "serde_bytes")]
-    pub token: Vec<u8>,
+    pub id: Option<ByteBuf>,
+    pub nodes: Option<ByteBuf>,
+    pub values: Option<Vec<ByteBuf>>, // peers
+    pub token: Option<ByteBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DHTResponse {
     pub r: DHTResponseResponse,
-    #[serde(with = "serde_bytes")]
-    pub v: Vec<u8>, // version
-    #[serde(with = "serde_bytes")]
-    pub t: Vec<u8>, // transaction ID
-    pub y: String, // message type
+    pub v: Option<ByteBuf>, // version
+    pub t: Option<ByteBuf>, // transaction ID
+    pub y: Option<String>, // message type
+}
+impl DHTResponse {
+    pub fn get_nodes(&self) -> Vec<Node> {
+        if let Some(nodes) = &self.r.nodes {
+            let nodes_size: usize = nodes.len() / 26;
+            let mut result = Vec::with_capacity(nodes_size);
+            let mut nodes_buff = Cursor::new(nodes);
+            for _ in 0..nodes_size {
+                let mut id = [0u8; 20];
+                let mut ip = [0u8; 4];
+                nodes_buff.read(&mut id).unwrap();
+                nodes_buff.read(&mut ip).unwrap();
+                let n = Node{
+                    id: id,
+                    ip: ip,
+                    port: nodes_buff.read_u16::<BigEndian>().unwrap(),
+                };
+                result.push(n);
+            }
+
+            return result;
+        }
+
+        vec![]
+    }
+    pub fn get_peers(&self) -> Vec<Peer> {
+        if let Some(peers) = &self.r.values {
+            let mut result: Vec<Peer> = Vec::with_capacity(peers.len());
+            for p in peers.iter() {
+                let mut peer_buff = Cursor::new(p);
+                let mut ip = [0u8; 4];
+                peer_buff.read(&mut ip).unwrap();
+                let p = Peer{
+                    ip: ip,
+                    port: peer_buff.read_u16::<BigEndian>().unwrap(),
+                };
+                result.push(p);
+            }
+
+            return result;
+        }
+
+        vec![]
+    }
 }
 
 impl GetPeersRequest {
@@ -62,11 +111,26 @@ impl GetPeersRequest {
     }
 }
 
+#[derive(Debug)]
 pub struct DHTManager {
     pub routers: Vec<std::net::SocketAddr>,
+    pub nodes: Vec<Node>,
+    pub peers: Vec<Peer>,
 
     pub socket: Option<std::net::UdpSocket>,
-    // TODO: save list of nodes?
+}
+
+pub fn new_default() -> DHTManager {
+    DHTManager{
+        routers: vec![
+            utils::create_dht_router_addr("router.bittorrent.com", 6881, true).unwrap(),
+            utils::create_dht_router_addr("tracker.coppersurfer.tk", 6969, true).unwrap(),
+            utils::create_dht_router_addr("dht.transmissionbt.com", 6881, true).unwrap(),
+        ],
+        nodes: Vec::<Node>::with_capacity(100),
+        peers: Vec::<Peer>::with_capacity(200),
+        socket: None,
+    }
 }
 
 impl DHTManager {
@@ -82,7 +146,7 @@ impl DHTManager {
         }
     }
 
-    // TODO: should return channel to receive an updated list of peers..
+    // TODO: should return channel to receive an updated list of peers.. ?
     pub fn get_peers(&self, infohash: &[u8]) {
         if let Some(socket) = &self.socket {
             let msg = GetPeersRequest{
@@ -92,24 +156,61 @@ impl DHTManager {
                 a: GetPeersRequestTrasaction{
                     id: infohash.to_vec(), // TODO: should be some random 20 bytes slice..
                     info_hash: infohash.to_vec(),
-                    want: vec!["n4".to_string(), "n6".to_string()],
+                    want: vec!["n4".to_string()] // nodes IPv6, "n6".to_string()], 
                 },
             };
 
             for r in self.routers.iter(){
                 socket.send_to(&msg.to_bencode().unwrap(), r);
             }
+            for n in self.nodes.iter(){
+                let addr = SocketAddr::from((n.ip, n.port));
+                socket.send_to(&msg.to_bencode().unwrap(), addr);
+            }
         }
     }
 
-    pub fn recv_peers(&self) {
+    pub fn recv_peers(&mut self) {
         if let Some(socket) = &self.socket {
-            let mut buff = [0u8; 1024];
+            let mut buff = [0u8; 2048];
             if let Ok((n, src)) = socket.recv_from(&mut buff) {
-                println!("{}, {:?}: {:?}", n, src, buff);
-                // TODO: check other bencode/bdecode libs.. this one does not support Option..
-                println!("{:?}", from_bytes::<DHTResponse>(&buff[..n]));
+                //println!("{}, {:?}: {:?}", n, src, buff);
+                match from_bytes::<DHTResponse>(&buff[..n]) {
+                    Ok(resp) => {
+                        println!("{:?}", resp);
+                        if self.nodes.len() < 100 {
+                            for n in resp.get_nodes() {
+                                self.nodes.push(n);
+                            }
+                        }
+                        for p in resp.get_peers() {
+                            self.peers.push(p);
+                        }
+
+                        println!("{:?}", self);
+                    },
+                    Err(e) => {
+                        println!("ERROR: {}", e);
+                    },
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bdecode_works() {
+        const INPUT: [u8; 356] = [100,49,58,114,100,50,58,105,100,50,48,58,60,56,25,141,42,131,140,155,130,154,204,134,244,101,138,80,149,76,178,239,50,58,105,112,52,58,87,219,33,178,53,58,110,111,100,101,115,50,48,56,58,60,56,24,135,184,217,159,50,227,121,127,232,134,234,230,182,87,164,197,204,132,154,119,10,250,203,60,56,23,214,174,82,144,73,241,241,187,233,235,179,166,219,60,135,12,225,120,50,67,75,172,96,60,56,23,214,174,82,144,73,241,241,187,233,235,179,166,219,60,135,12,225,80,2,3,75,136,188,60,56,22,214,174,82,144,73,241,241,187,233,235,179,166,219,60,135,12,225,154,68,5,156,254,122,60,56,9,43,3,30,77,129,75,232,249,57,145,33,147,180,112,197,64,210,92,57,190,197,26,233,60,56,11,73,241,241,187,233,235,179,166,219,60,135,12,62,153,36,94,82,190,47,120,18,95,101,60,56,13,153,90,252,17,185,200,191,213,35,70,176,175,69,89,37,231,13,37,23,221,159,200,213,60,56,12,19,33,244,111,119,57,178,63,103,254,105,52,171,176,231,54,45,106,102,11,22,182,173,53,58,116,111,107,101,110,50,48,58,82,215,117,175,125,94,63,180,64,184,16,253,246,107,39,143,99,198,60,78,54,58,118,97,108,117,101,115,108,54,58,79,130,127,130,33,174,54,58,151,41,225,24,33,177,54,58,109,66,33,194,33,173,54,58,188,163,51,130,33,173,101,101,49,58,116,49,58,13,49,58,118,52,58,85,84,98,22,49,58,121,49,58,114,101];
+        let resp = serde_bencode::de::from_bytes::<crate::bittorrent::dht::DHTResponse>(&INPUT).unwrap();
+        println!("{:?}", resp);
+        let nodes = resp.get_nodes();
+        println!("{:?}", nodes);
+        let peers = resp.get_peers();
+        println!("{:?}", peers);
+
+        let ok = (nodes.len() == 8) && (peers.len() == 4);
+        assert_eq!(ok, true);
     }
 }
