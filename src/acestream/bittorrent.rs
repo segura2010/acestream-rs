@@ -19,24 +19,24 @@ pub fn new_client(t: torrent::Torrent) -> BitTorrentClient {
 
 impl BitTorrentClient {
     pub fn start(&mut self) {
-        let mut infohash = hex::decode(self.torrent.infohash.as_str().to_string()).unwrap();
+        let infohash = hex::decode(self.torrent.infohash.as_str().to_string()).unwrap();
         self.dht.infohash = infohash.as_slice().to_vec();
         self.dht.listen(format!("0.0.0.0:{}", DHT_PORT));
 
-        // TODO: check what is happening.. I receive nodes but not peers..
         self.dht.get_peers(&infohash);
+        let mut i = 0;
         loop{
             println!("Updating peers..");
             self.dht.recv_peers();
             println!("Nodes: {:?}", self.dht.nodes);
             println!("Peers: {:?}", self.dht.peers);
             if self.dht.peers.len() > 2 {
-                break;
+                // TODO: start video download
+            } else if i == self.dht.nodes.len() {
+                self.dht.get_peers(&infohash);
+                i = 0;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1000));
-        }
-
-        loop{
+            i += 1;
             std::thread::sleep(std::time::Duration::from_millis(1000));
         }
     }

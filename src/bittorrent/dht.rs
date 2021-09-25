@@ -12,6 +12,8 @@ use serde_bytes::ByteBuf;
 use std::io::{Write, Read, Cursor};
 use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
 
+use rand::prelude::*;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetPeersRequestTrasaction {
     #[serde(with = "serde_bytes")]
@@ -25,7 +27,7 @@ pub struct GetPeersRequestTrasaction {
 pub struct GetPeersRequest {
     pub a: GetPeersRequestTrasaction, // information about the query
     pub q: String, // query type
-    //pub ro: 
+    pub ro: i32, // read only
     pub t: i32, // transaction ID
     pub y: String, // message type
 }
@@ -112,13 +114,14 @@ impl GetPeersRequest {
     }
 }
 
-fn new_getpeersrequest(tid: i32, infohash: Vec<u8>) -> GetPeersRequest {
+fn new_getpeersrequest(tid: i32, node_id: Vec<u8>, infohash: Vec<u8>) -> GetPeersRequest {
     GetPeersRequest{
         q: "get_peers".to_string(),
         t: tid,
+        ro: 1,
         y: "q".to_string(),
         a: GetPeersRequestTrasaction{
-            id: infohash.as_slice().to_vec(), // TODO: should be some random 20 bytes slice..
+            id: node_id.as_slice().to_vec(),
             info_hash: infohash.as_slice().to_vec(),
             want: vec!["n4".to_string()] // nodes IPv6, "n6".to_string()], 
         },
@@ -127,12 +130,23 @@ fn new_getpeersrequest(tid: i32, infohash: Vec<u8>) -> GetPeersRequest {
 
 #[derive(Debug)]
 pub struct DHTManager {
+    pub transaction_id: i32,
+    pub node_id: Vec<u8>,
     pub infohash: Vec<u8>,
     pub routers: Vec<std::net::SocketAddr>,
     pub nodes: HashSet<Node>,
     pub peers: HashSet<Peer>,
 
     pub socket: Option<std::net::UdpSocket>,
+}
+
+fn generate_random_id(size: usize) -> Vec<u8> {
+    let mut rng = rand::thread_rng();
+    let mut result: Vec<u8> = Vec::with_capacity(size);
+    for i in 0..size {
+        result.push(rng.gen());
+    }
+    result
 }
 
 pub fn new_default() -> DHTManager {
@@ -146,6 +160,8 @@ pub fn new_default() -> DHTManager {
     routers.append(&mut utils::create_dht_router_addr("dht.libtorrent.org", 25401, true).unwrap());
 
     DHTManager{
+        transaction_id: 0,
+        node_id: generate_random_id(20),
         infohash: vec![],
         routers: routers,
         nodes: HashSet::<Node>::with_capacity(100),
@@ -170,14 +186,16 @@ impl DHTManager {
     }
 
     // TODO: should return channel to receive an updated list of peers.. ?
-    pub fn get_peers(&self, infohash: &[u8]) {
+    pub fn get_peers(&mut self, infohash: &[u8]) {
         if let Some(socket) = &self.socket {
-            let msg = new_getpeersrequest(1, infohash.to_vec());
-
             for r in self.routers.iter(){
+                let msg = new_getpeersrequest(self.transaction_id, self.node_id.as_slice().to_vec(), infohash.to_vec());
+                self.transaction_id += 1;
                 socket.send_to(&msg.to_bencode().unwrap(), r);
             }
             for n in self.nodes.iter(){
+                let msg = new_getpeersrequest(self.transaction_id, self.node_id.as_slice().to_vec(), infohash.to_vec());
+                self.transaction_id += 1;
                 let addr = SocketAddr::from((n.ip, n.port));
                 socket.send_to(&msg.to_bencode().unwrap(), addr);
             }
@@ -198,7 +216,8 @@ impl DHTManager {
                             let inserted = self.nodes.insert(n);
                             if inserted {
                                 // query new nodes :)
-                                let msg = new_getpeersrequest(1, self.infohash.as_slice().to_vec());
+                                let msg = new_getpeersrequest(self.transaction_id, self.node_id.as_slice().to_vec(), self.infohash.as_slice().to_vec());
+                                self.transaction_id += 1;
                                 socket.send_to(&msg.to_bencode().unwrap(), SocketAddr::from((ip, port)));
                             }
                         }
