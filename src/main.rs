@@ -20,10 +20,16 @@ async fn main() {
                     .help("Player ID/Content ID")
                     .required(false)
                     .takes_value(true))
+                .arg(clap::Arg::with_name("workers")
+                    .short("w")
+                    .help("Number of workers (threads) to download video")
+                    .required(false)
+                    .takes_value(true))
                 .get_matches();
     
     let torrent_file = args.value_of("torrent").unwrap_or("");
     let player_id = args.value_of("playerid").unwrap_or("");
+    let workers: usize = args.value_of("workers").unwrap_or("6").parse().unwrap();
 
     let mut torrent: Option<acestream::torrent::Torrent> = None;
     if player_id.len() > 0 {
@@ -52,9 +58,7 @@ async fn main() {
     if let Some(t) = torrent {
         println!("{:#?}", t);
         // TODO: look for peers, downlaod, play :)
-        // the following code must be moved to a class; it is just a test
-        // communication with trackers, some example code: https://github.com/mandreyel/cratetorrent/blob/master/cratetorrent/src/tracker.rs
         let mut bt_client = acestream::bittorrent::new_client(t);
-        bt_client.start();
+        bt_client.start(workers);
     }
 }

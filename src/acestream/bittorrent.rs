@@ -18,7 +18,7 @@ pub fn new_client(t: torrent::Torrent) -> BitTorrentClient {
 }
 
 impl BitTorrentClient {
-    pub fn start(&mut self) {
+    pub fn start(&mut self, workers: usize) {
         let infohash = hex::decode(self.torrent.infohash.as_str().to_string()).unwrap();
         self.dht.infohash = infohash.as_slice().to_vec();
         self.dht.listen(format!("0.0.0.0:{}", DHT_PORT));
@@ -28,8 +28,8 @@ impl BitTorrentClient {
         loop{
             println!("Updating peers..");
             self.dht.recv_peers();
-            println!("Nodes: {:?}", self.dht.nodes);
-            println!("Peers: {:?}", self.dht.peers);
+            println!("Peers: {:?} (len={})", self.dht.peers, self.dht.peers.len());
+            println!("Nodes: {:?}", self.dht.nodes.len());
             if self.dht.peers.len() > 2 {
                 // TODO: start video download
             } else if i == self.dht.nodes.len() {
