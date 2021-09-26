@@ -2,8 +2,9 @@
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::sync::mpsc::{Sender, Receiver};
-use std::net::TcpStream;
-use std::io::{Write, Read};
+use std::net::{TcpStream, SocketAddr};
+use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
+use std::io::{Write, Read, Cursor};
 
 use rand::prelude::*;
 use rand::seq::SliceRandom;
@@ -83,6 +84,31 @@ impl BitTorrentClient {
     }
 }
 
+pub struct BitTorrentPacket {
+    length: i32,
+    id: i8,
+    data: Option<Vec<u8>>,
+}
+fn packet_from_header(header: Vec<u8>) -> BitTorrentPacket {
+    let mut cursor = Cursor::new(header);
+    BitTorrentPacket{
+        length: cursor.read_i32::<BigEndian>().unwrap(),
+        id: cursor.read_i8().unwrap(),
+        data: None,
+    }
+}
+impl BitTorrentPacket {
+    fn as_bytes(&self) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(self.length as usize);
+        packet.write_i32::<BigEndian>(self.length);
+        packet.write_i8(self.id);
+        if let Some(data) = &self.data {
+            packet.write(&data);
+        }
+        packet
+    }
+}
+
 pub struct Piece {
     unknown1: i32,
     piece_idx: i32,
@@ -126,5 +152,61 @@ impl PeerConnector {
             }
             std::thread::sleep(std::time::Duration::from_millis(1000));
         }
+    }
+
+    fn connect(&mut self, peer: dht::Peer) -> Result<u8, String> {
+        let conn = TcpStream::connect_timeout(&SocketAddr::from((peer.ip, peer.port)), 
+                    std::time::Duration::from_millis(2500));
+        match conn {
+            Ok(s) => {
+                s.set_read_timeout(Some(std::time::Duration::from_millis(5000)));
+                s.set_write_timeout(Some(std::time::Duration::from_millis(2000)));
+                self.socket = Some(s);
+                return Ok(1);
+            },
+            Err(e) => {
+                return Err(e.to_string());
+            },
+        }
+    }
+
+    fn recv(&self) -> Result<BitTorrentPacket, String> {
+        // TODO: receive header and payload
+        if let Some(mut socket) = self.socket.as_ref() {
+            let mut header = [0u8; 5]; // 4 bytes for length + 1 for message ID
+            match socket.read(&mut header) {
+                Ok(n) => {
+                    let mut packet = packet_from_header(header.to_vec());
+                    if packet.length > 50000 || packet.length < 0 {
+                        return Err(format!("bad_packet_len:{}", packet.length).to_string());
+                    }
+                    // TODO: receive packet payload.. we need a loop (?)
+                    /*let mut buff = [u8; 10000];
+                    match socket.read(&mut buff) {
+                        Ok(n) => {
+                            packet.id = 
+                        },
+                        Err(e) => {
+                            return Err(e.to_string());
+                        },
+                    }*/
+                },
+                Err(e) => {
+                    return Err(e.to_string());
+                },
+            }
+        }
+        Err("error_recieving_packet".to_string())
+    }
+
+    fn send(&self, packet: BitTorrentPacket) -> Result<usize, String> {
+        if let Some(mut s) = self.socket.as_ref() {
+            let result = s.write(&packet.as_bytes());
+            match result {
+                Ok(n) => { return Ok(n) },
+                Err(e) => { return Err(e.to_string()) },
+            }
+        }
+        Err("no_tcpsocket".to_string())
     }
 }
