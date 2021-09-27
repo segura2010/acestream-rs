@@ -8,6 +8,7 @@ use std::io::{Write, Read, Cursor};
 
 use rand::prelude::*;
 use rand::seq::SliceRandom;
+use rand::distributions::Slice;
 
 use crate::acestream::torrent;
 use crate::bittorrent::dht;
@@ -149,12 +150,24 @@ impl PeerConnector {
             if let Some(p) = peers.choose(&mut rng) {
                 self.actual_peer = Some(*p);
                 println!("Worker selected peer: {:?}", self.actual_peer);
+                if let Ok(_) = self.connect(self.actual_peer.unwrap()) {
+                    self.start_download();
+                } else {
+                    // TODO: maybe flag?
+                    continue;
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(1000));
         }
     }
 
-    fn connect(&mut self, peer: dht::Peer) -> Result<u8, String> {
+    fn start_download(&self) -> Result<usize, String> {
+        // TODO: send&recv handshake, send&recv peerid, recv extend_info packet (update actual position),
+        // send our extend_info packet, start piece donwload loop
+        Err("unimplemented".to_string())
+    }
+
+    fn connect(&mut self, peer: dht::Peer) -> Result<usize, String> {
         let conn = TcpStream::connect_timeout(&SocketAddr::from((peer.ip, peer.port)), 
                     std::time::Duration::from_millis(2500));
         match conn {
@@ -171,7 +184,6 @@ impl PeerConnector {
     }
 
     fn recv(&self) -> Result<BitTorrentPacket, String> {
-        // TODO: receive header and payload
         if let Some(mut socket) = self.socket.as_ref() {
             let mut header = [0u8; 5]; // 4 bytes for length + 1 for message ID
             match socket.read(&mut header) {
@@ -180,16 +192,26 @@ impl PeerConnector {
                     if packet.length > 50000 || packet.length < 0 {
                         return Err(format!("bad_packet_len:{}", packet.length).to_string());
                     }
-                    // TODO: receive packet payload.. we need a loop (?)
-                    /*let mut buff = [u8; 10000];
-                    match socket.read(&mut buff) {
-                        Ok(n) => {
-                            packet.id = 
-                        },
-                        Err(e) => {
-                            return Err(e.to_string());
-                        },
-                    }*/
+                    let mut buff = [0u8; 5000];
+                    let mut payload = Vec::with_capacity(packet.length as _);
+                    let mut read_bytes = 0usize;
+                    loop {
+                        if read_bytes >= (packet.length as _){
+                            break;
+                        }
+                        match socket.read(&mut buff) {
+                            Ok(n) => {
+                                read_bytes += n;
+                                payload.extend_from_slice(&buff[0..n]);
+                                continue;
+                            },
+                            Err(e) => {
+                                return Err(e.to_string());
+                            },
+                        }
+                    }
+                    packet.data = Some(payload);
+                    return Ok(packet);
                 },
                 Err(e) => {
                     return Err(e.to_string());
@@ -209,4 +231,64 @@ impl PeerConnector {
         }
         Err("no_tcpsocket".to_string())
     }
+
+    fn send_handshake(&self) -> Result<usize, String>{
+        if let Some(mut s) = self.socket.as_ref() {
+            let mut payload: Vec<u8> = Vec::with_capacity(46);
+
+            payload.write_u8(0x11);
+            payload.write(b"AceStreamProtocol");
+            payload.write_i64::<BigEndian>(0);
+            payload.write(&hex::decode(self.torrent.infohash.as_str().to_string()).unwrap());
+
+            let result = s.write(&payload);
+            match result {
+                Ok(n) => { return Ok(n) },
+                Err(e) => { return Err(e.to_string()) },
+            }
+        }
+        Err("no_tcpsocket".to_string())
+    }
+    fn recv_handshake(&self) -> Result<Vec<u8>, String>{
+        if let Some(mut s) = self.socket.as_ref() {
+            let mut payload = [0u8; 46];
+            let result = s.read(&mut payload);
+            match result {
+                Ok(n) => { return Ok(payload.to_vec()) },
+                Err(e) => { return Err(e.to_string()) },
+            }
+        }
+        Err("no_tcpsocket".to_string())
+    }
+
+    fn send_peer_id(&self) -> Result<usize, String>{
+        if let Some(mut s) = self.socket.as_ref() {
+            let payload = format!("R20------{}", generate_peer_id(11));
+
+            let result = s.write(payload.as_bytes());
+            match result {
+                Ok(n) => { return Ok(n) },
+                Err(e) => { return Err(e.to_string()) },
+            }
+        }
+        Err("no_tcpsocket".to_string())
+    }
+    fn recv_peer_id(&self) -> Result<Vec<u8>, String>{
+        if let Some(mut s) = self.socket.as_ref() {
+            let mut payload = [0u8; 20];
+            let result = s.read(&mut payload);
+            match result {
+                Ok(n) => { return Ok(payload.to_vec()) },
+                Err(e) => { return Err(e.to_string()) },
+            }
+        }
+        Err("no_tcpsocket".to_string())
+    }
+}
+
+fn generate_peer_id(size: usize) -> String {
+    let alphabet = Slice::new(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789").unwrap();
+    let rng = rand::thread_rng();
+    let peer_id: Vec<u8> = rng.sample_iter(&alphabet).take(size).map(|b| { *b }).collect();
+    String::from_utf8(peer_id).unwrap()
 }
