@@ -16,6 +16,20 @@ use crate::bittorrent::dht;
 const DHT_PORT: u16 = 8621;
 const BITTORRENT_PORT: u16 = 8621;
 
+// BitTorrent Protocol Messages IDs
+const CMD_CHOKE: u8 = 0;
+const CMD_UNCHOKE: u8 = 1;
+const CMD_INTERESTED: u8 = 2;
+const CMD_NOT_INTERESTED: u8 = 3;
+const CMD_HAVE: u8 = 4;
+const CMD_BITFIELD: u8 = 5;
+const CMD_REQUEST: u8 = 6;
+const CMD_PIECE: u8 = 7;
+const CMD_CANCEL: u8 = 8;
+const CMD_PORT: u8 = 9;
+const CMD_EXTEND_INFO_11: u8 = 11;
+const CMD_EXTEND_INFO: u8 = 0x14;
+
 pub struct BitTorrentClient {
     torrent: torrent::Torrent,
     dht: dht::DHTManager,
@@ -100,13 +114,18 @@ fn packet_from_header(header: Vec<u8>) -> BitTorrentPacket {
 }
 impl BitTorrentPacket {
     fn as_bytes(&self) -> Vec<u8> {
-        let mut packet = Vec::with_capacity(self.length as usize);
-        packet.write_i32::<BigEndian>(self.length);
-        packet.write_i8(self.id);
         if let Some(data) = &self.data {
+            let mut packet = Vec::with_capacity(data.len() + 4 + 1); // len + cmd + payload.len()
+            packet.write_i32::<BigEndian>((data.len() + 1) as _); // cmd + payload.len()
+            packet.write_i8(self.id);
             packet.write(&data);
+            return packet;
+        } else {
+            let mut packet = Vec::with_capacity(5);
+            packet.write_i32::<BigEndian>(1); // cmd + payload.len()
+            packet.write_i8(self.id);
+            return packet;
         }
-        packet
     }
 }
 
@@ -283,6 +302,24 @@ impl PeerConnector {
             }
         }
         Err("no_tcpsocket".to_string())
+    }
+
+    fn request_piece_chunk(&self, piece: i64, chunk: i16) -> Result<usize, String>{
+        let mut payload: Vec<u8> = Vec::with_capacity(10);
+        payload.write_i64::<BigEndian>(piece);
+        payload.write_i16::<BigEndian>(chunk);
+        let mut packet = BitTorrentPacket{
+            length: 11,
+            id: CMD_REQUEST as _,
+            data: Some(payload),
+        };
+        self.send(packet)
+    }
+    fn request_piece(&self, piece: i64) {
+        let piece_chunks = self.torrent.piece_length / self.torrent.chunk_length;
+        for i in 0..piece_chunks {
+            self.request_piece_chunk(piece, i as _);
+        }
     }
 }
 
