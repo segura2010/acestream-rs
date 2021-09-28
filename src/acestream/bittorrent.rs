@@ -10,7 +10,13 @@ use rand::prelude::*;
 use rand::seq::SliceRandom;
 use rand::distributions::Slice;
 
+use serde::{Serialize, Deserialize};
+use serde_bencode::de::from_bytes;
+use serde_bencode::ser::to_bytes;
+use serde_bytes::ByteBuf;
+
 use crate::acestream::torrent;
+use crate::acestream::api;
 use crate::bittorrent::dht;
 
 const DHT_PORT: u16 = 8621;
@@ -35,6 +41,8 @@ pub struct BitTorrentClient {
     dht: dht::DHTManager,
     peers: Arc<Mutex<Vec<dht::Peer>>>,
     started_workers: bool,
+
+    actual_position: Arc<Mutex<i64>>,
     
     tx: Sender<Piece>,
     rx: Receiver<Piece>,
@@ -47,6 +55,7 @@ pub fn new_client(t: torrent::Torrent) -> BitTorrentClient {
         dht: dht::new_default(),
         peers: Arc::new(Mutex::new(Vec::with_capacity(30))),
         started_workers: false,
+        actual_position: Arc::new(Mutex::new(-1)),
         tx: tx,
         rx: rx,
     }
@@ -90,9 +99,10 @@ impl BitTorrentClient {
             let shared_tx = self.tx.clone();
             let shared_peers = self.peers.clone();
             let torrent = self.torrent.clone();
+            let shared_act_pos = self.actual_position.clone();
 
             std::thread::spawn(move||{
-                let mut connector = new_connector(torrent, shared_peers, shared_tx);
+                let mut connector = new_connector(torrent, shared_peers, shared_tx, shared_act_pos);
                 connector.start();
             });
         }
@@ -101,14 +111,14 @@ impl BitTorrentClient {
 
 pub struct BitTorrentPacket {
     length: i32,
-    id: i8,
+    id: u8,
     data: Option<Vec<u8>>,
 }
 fn packet_from_header(header: Vec<u8>) -> BitTorrentPacket {
     let mut cursor = Cursor::new(header);
     BitTorrentPacket{
         length: cursor.read_i32::<BigEndian>().unwrap(),
-        id: cursor.read_i8().unwrap(),
+        id: cursor.read_u8().unwrap(),
         data: None,
     }
 }
@@ -117,13 +127,13 @@ impl BitTorrentPacket {
         if let Some(data) = &self.data {
             let mut packet = Vec::with_capacity(data.len() + 4 + 1); // len + cmd + payload.len()
             packet.write_i32::<BigEndian>((data.len() + 1) as _); // cmd + payload.len()
-            packet.write_i8(self.id);
+            packet.write_u8(self.id);
             packet.write(&data);
             return packet;
         } else {
             let mut packet = Vec::with_capacity(5);
             packet.write_i32::<BigEndian>(1); // cmd + payload.len()
-            packet.write_i8(self.id);
+            packet.write_u8(self.id);
             return packet;
         }
     }
@@ -144,15 +154,20 @@ pub struct PeerConnector {
     send_chan: Sender<Piece>,
     actual_peer: Option<dht::Peer>,
 
+    actual_position: i64,
+    actual_position_client: Arc<Mutex<i64>>,
+
     socket: Option<TcpStream>,
 }
 
-pub fn new_connector(t: torrent::Torrent, peers: Arc<Mutex<Vec<dht::Peer>>>, chan: Sender<Piece>) -> PeerConnector {
+pub fn new_connector(t: torrent::Torrent, peers: Arc<Mutex<Vec<dht::Peer>>>, chan: Sender<Piece>, act_pos: Arc<Mutex<i64>>) -> PeerConnector {
     PeerConnector{
         torrent: t,
         peers: peers,
         send_chan: chan,
         actual_peer: None,
+        actual_position: -1,
+        actual_position_client: act_pos,
         socket: None,
     }
 }
@@ -180,9 +195,80 @@ impl PeerConnector {
         }
     }
 
-    fn start_download(&self) -> Result<usize, String> {
-        // TODO: send&recv handshake, send&recv peerid, recv extend_info packet (update actual position),
-        // send our extend_info packet, start piece donwload loop
+    fn start_download(&mut self) -> Result<usize, String> {
+        self.send_handshake();
+        let handshake = self.recv_handshake()?;
+        if let Ok(client) = String::from_utf8(handshake[1..18].to_vec()) {
+            if client.ne("AceStreamProtocol") {
+                return Err("no_acestream_protocol".to_string());
+            }
+        }
+        self.send_peer_id();
+        self.recv_peer_id();
+
+        // receive EXTEND_INFO
+        match self.recv() {
+            Ok(pkt) => {
+                if pkt.id == CMD_EXTEND_INFO {
+                    match from_bytes::<InitialExtendInfo>(&pkt.data.unwrap()) {
+                        Ok(info) => {
+                            self.actual_position = info.mi.max_piece;
+                            println!("Received actual position: {} (from: {:?})", self.actual_position, self.actual_peer);
+                        },
+                        Err(e) => {
+                            return Err(format!("error_bdecoding_extend_info:{}", e).to_string());
+                        },
+                    }
+                } else {
+                    return Err("error_extend_info_not_recv".to_string());
+                }
+            },
+            Err(e) => {
+                return Err(format!("error_receiving_extend_info:{}", e).to_string());
+            },
+        }
+
+        // send my initial extend_info
+        {
+            let packet = new_initial_extend_info_packet(&self.actual_peer.unwrap().ip);
+            self.send(packet);
+            self.recv();
+        }
+        // send interested
+        {
+            let packet = BitTorrentPacket{
+                id: CMD_INTERESTED,
+                length: 1,
+                data: None,
+            };
+            self.send(packet);
+            self.recv();
+        }
+
+        // some set up to start the pieces download
+        let mut last_piece = Piece{
+            unknown1: 0,
+            piece_idx: 0,
+            unknown2: 0,
+            chunk_idx: 0,
+            data: Vec::with_capacity(self.torrent.piece_length - 0x60), // -0x60 -> signature in the last chunk is 0x60 bytes long
+        };
+        let mut last_piece_time = std::time::Instant::now();
+        let piece_chunks = self.torrent.piece_length / self.torrent.chunk_length;
+        let mut received_chunks = 0;
+        let mut requested_piece = true;
+        // update bittorrent client position if it is very old or -1 (not started)
+        {
+            let mut client_pos = self.actual_position_client.lock().unwrap();
+            let very_old_pos = (self.actual_position - *client_pos) > 60;
+            if *client_pos == -1 || very_old_pos {
+                *client_pos = self.actual_position;
+                self.request_piece(self.actual_position);
+            }
+        }
+
+        // TODO: download loop
+
         Err("unimplemented".to_string())
     }
 
@@ -328,4 +414,79 @@ fn generate_peer_id(size: usize) -> String {
     let rng = rand::thread_rng();
     let peer_id: Vec<u8> = rng.sample_iter(&alphabet).take(size).map(|b| { *b }).collect();
     String::from_utf8(peer_id).unwrap()
+}
+
+// BitTorrent BENCODE messages
+#[derive(Debug, Serialize, Deserialize)]
+struct InitialExtendInfo {
+    pv: i64,
+    tt: String,
+    mi: InitialExtendInfoMI,
+    ts: i64,
+    p: i64,
+    lsp: i64,
+    v: i64,
+    nt: i64,
+    opts: i64,
+    yourip: Vec<u8>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct InitialExtendInfoMI {
+    down_rate: i64,
+    min_piece: i64,
+    live_window_size: i64,
+    is_accessible: i32,
+    top_up_rate: i64,
+    top_session_up_rate: i64,
+    max_piece: i64,
+    position: i64,
+    up_rate: i64,
+    upload_rating: i64,
+}
+
+impl InitialExtendInfo {
+    pub fn to_bencode(&self) -> Result<Vec<u8>, String> {
+        let encoded = to_bytes(self);
+        if let Err(e) = encoded {
+            return Err(format!("error_bencoding:{}", e).to_string())
+        }
+        return Ok(encoded.unwrap());
+    }
+}
+
+fn new_initial_extend_info_packet(peer_addr: &[u8]) -> BitTorrentPacket {
+    let mut version_code: i64 = 3013200;
+    if let Ok(v_code) = api::VERSION_CODE.parse() {
+        version_code = v_code;
+    }
+
+    let payload = InitialExtendInfo{
+        pv: 2,
+        tt: "bt".to_string(),
+        mi: InitialExtendInfoMI{
+            down_rate: 80000,
+            min_piece: -1,
+            live_window_size: 987,
+            is_accessible: 0,
+            top_up_rate: 0,
+            top_session_up_rate: 0,
+            max_piece: -1,
+            position: -1,
+            up_rate: 0,
+            upload_rating: 0,
+        },
+        ts: 413,
+        p: BITTORRENT_PORT as _,
+        lsp: 284912,
+        v: version_code,
+        nt: 1,
+        opts: 15,
+        yourip: peer_addr.to_vec(),
+    };
+
+    BitTorrentPacket{
+        id: CMD_EXTEND_INFO,
+        length: 0,
+        data: Some(payload.to_bencode().unwrap()),
+    }
 }

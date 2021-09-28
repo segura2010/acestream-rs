@@ -6,7 +6,7 @@ use serde::{Serialize, Deserialize};
 const BASE_URL: &str = "http://s1.torrentstream.org";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.50 Safari/537.36 AceStream/3.1.32";
 const VERSION: &str = "3.1.32";
-const VERSION_CODE: &str = "3013200";
+pub const VERSION_CODE: &str = "3013200";
 const SIGN_SALT: &str = "H!+:H1NnvvX\\x0bS'(;0/A\\nR{${\\n/3%1\\x0b*[r0o>QzNGKkXT@v\\x0b3DN;gx_66L2 {`F0,\\tKm>XoG~iY(\\x0bu]6E}\\t~07&H;9qE1d?d-A7S(";
 
 async fn _do_get(url: String) -> Result<reqwest::Response, String> {
