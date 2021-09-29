@@ -364,7 +364,7 @@ impl PeerConnector {
                     if !requested_piece {
                         {
                             let act_pos_client = self.actual_position_client.lock().unwrap();
-                            let old_piece = *act_pos_client <= (self.actual_position-1);
+                            let old_piece = *act_pos_client == (self.actual_position-1);
                             if *act_pos_client != -1 && !old_piece {
                                 self.actual_position = *act_pos_client;
                             }
