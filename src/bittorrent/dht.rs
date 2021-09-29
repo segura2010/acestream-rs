@@ -228,7 +228,7 @@ impl DHTManager {
                         return Ok(());
                     },
                     Err(e) => {
-                        println!("ERROR: {}", e);
+                        //println!("ERROR: {}", e);
                         return Err(e.to_string());
                     },
                 }

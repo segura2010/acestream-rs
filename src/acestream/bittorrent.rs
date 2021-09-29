@@ -69,12 +69,18 @@ impl BitTorrentClient {
 
         self.dht.get_peers(&infohash);
         let mut old_peers_len = self.dht.peers.len();
+        let mut old_nodes_len = self.dht.nodes.len();
         let mut i = 0;
+        println!("Updating peers..");
         loop{
-            println!("Updating peers..");
             self.dht.recv_peers();
-            println!("Peers: {}", self.dht.peers.len());
-            println!("Nodes: {}", self.dht.nodes.len());
+            if old_peers_len != self.dht.peers.len() {
+                println!("Peers: {}", self.dht.peers.len());
+            }
+            if old_nodes_len != self.dht.nodes.len() {
+                old_nodes_len = self.dht.nodes.len();
+                println!("Nodes: {}", self.dht.nodes.len());
+            }
             if !self.started_workers && self.dht.peers.len() >= 2 {
                 self.start_workers(workers);
                 self.started_workers = true;
@@ -155,16 +161,14 @@ pub struct Piece {
 // TODO: fn new piece from bytes
 fn new_piece_from_bytes(data: Vec<u8>, piece_len: usize) -> Piece {
     let mut cursor = Cursor::new(data);
-    let mut buff: Vec<u8> = Vec::with_capacity(piece_len);
     let mut p = Piece{
         unknown1: cursor.read_i32::<BigEndian>().unwrap(),
         piece_idx: cursor.read_i32::<BigEndian>().unwrap(),
         unknown2: cursor.read_i64::<BigEndian>().unwrap(),
         chunk_idx: cursor.read_i16::<BigEndian>().unwrap(),
-        data: vec![],
+        data: vec![0u8; piece_len],
     };
-    cursor.read(&mut buff);
-    p.data = buff;
+    cursor.read(&mut p.data);
     p
 }
 
@@ -227,6 +231,7 @@ impl PeerConnector {
             }
         }
         self.send_peer_id();
+        self.recv_peer_id();
 
         // receive EXTEND_INFO
         match self.recv() {
@@ -299,11 +304,15 @@ impl PeerConnector {
                                 received_chunks += 1;
                                 if received_chunks >= (piece_chunks as _) {
                                     // last chunk, we must remove the signature from the video payload
-                                    last_piece.data.extend_from_slice(&piece.data.as_slice()[..piece.data.len()-0x60]);
-                                    println!("Received full piece ({}) from {:?}", piece.piece_idx, self.actual_peer);
+                                    println!("Received full piece ({}) from {:?} (chunklen={})", piece.piece_idx, self.actual_peer, piece.data.len());
+                                    last_piece.data.extend_from_slice(&piece.data[..piece.data.len()-0x60]);
                                     // TODO: send to pieces channel (and receive in another thread)
+                                    self.actual_position += 1;
+                                    requested_piece = false;
                                 } else {
+                                    //println!("Received chunk {}/{} (piece:{}) from {:?} (chunklen={})", piece.chunk_idx, piece_chunks, piece.piece_idx, self.actual_peer, piece.data.len());
                                     last_piece.data.extend_from_slice(&piece.data);
+                                    continue;
                                 }
                             }
                         },
@@ -321,7 +330,8 @@ impl PeerConnector {
                     if !requested_piece {
                         {
                             let act_pos_client = self.actual_position_client.lock().unwrap();
-                            if *act_pos_client != -1 {
+                            let old_piece = *act_pos_client <= (self.actual_position-1);
+                            if *act_pos_client != -1 && !old_piece {
                                 self.actual_position = *act_pos_client;
                             }
                         }
@@ -356,22 +366,31 @@ impl PeerConnector {
     fn recv(&self) -> Result<BitTorrentPacket, String> {
         if let Some(mut socket) = self.socket.as_ref() {
             let mut header = [0u8; 5]; // 4 bytes for length + 1 for message ID
-            match socket.read(&mut header) {
+            match socket.read(&mut header[..4]) {
                 Ok(n) => {
                     let mut packet = packet_from_header(header.to_vec());
-                    if packet.length > 50000 || packet.length < 0 {
+                    if packet.length > 100000 || packet.length < 0 {
                         return Err(format!("bad_packet_len:{}", packet.length).to_string());
                     }
-                    let mut buff = [0u8; 5000];
+                    const BUF_SIZE: usize = 5000;
+                    let mut buff = [0u8; BUF_SIZE];
                     let mut payload = Vec::with_capacity(packet.length as _);
                     let mut read_bytes = 0usize;
+                    let mut diff = (packet.length as usize) - read_bytes;
+                    if diff > BUF_SIZE {
+                        diff = BUF_SIZE;
+                    }
                     loop {
-                        if read_bytes >= ((packet.length-1) as _){
+                        if read_bytes >= (packet.length as _){
                             break;
                         }
-                        match socket.read(&mut buff) {
+                        match socket.read(&mut buff[..diff]) {
                             Ok(n) => {
                                 read_bytes += n;
+                                diff = (packet.length as usize) - read_bytes;
+                                if diff > BUF_SIZE {
+                                    diff = BUF_SIZE;
+                                }
                                 payload.extend_from_slice(&buff[0..n]);
                                 continue;
                             },
@@ -380,7 +399,8 @@ impl PeerConnector {
                             },
                         }
                     }
-                    packet.data = Some(payload);
+                    packet.id = payload[0];
+                    packet.data = Some(payload[1..].to_vec());
                     return Ok(packet);
                 },
                 Err(e) => {
