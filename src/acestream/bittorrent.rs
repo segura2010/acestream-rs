@@ -44,20 +44,17 @@ pub struct BitTorrentClient {
 
     actual_position: Arc<Mutex<i64>>,
     
-    tx: Sender<Piece>,
-    rx: Receiver<Piece>,
+    tx: Option<Sender<FullPiece>>,
 }
 
 pub fn new_client(t: torrent::Torrent) -> BitTorrentClient {
-    let (tx, rx) = mpsc::channel();
     BitTorrentClient{
         torrent: t,
         dht: dht::new_default(),
         peers: Arc::new(Mutex::new(Vec::with_capacity(30))),
         started_workers: false,
         actual_position: Arc::new(Mutex::new(-1)),
-        tx: tx,
-        rx: rx,
+        tx: None,
     }
 }
 
@@ -66,6 +63,9 @@ impl BitTorrentClient {
         let infohash = hex::decode(self.torrent.infohash.as_str().to_string()).unwrap();
         self.dht.infohash = infohash.as_slice().to_vec();
         self.dht.listen(format!("0.0.0.0:{}", DHT_PORT));
+
+        //let (tx, rx) = mpsc::channel();
+        //self.tx = Some(tx);
 
         self.dht.get_peers(&infohash);
         let mut old_peers_len = self.dht.peers.len();
@@ -82,6 +82,7 @@ impl BitTorrentClient {
                 println!("Nodes: {}", self.dht.nodes.len());
             }
             if !self.started_workers && self.dht.peers.len() >= 2 {
+                self.start_manager_worker();
                 self.start_workers(workers);
                 self.started_workers = true;
                 // TODO: create new thread to receive pieces from workers
@@ -103,7 +104,7 @@ impl BitTorrentClient {
 
     fn start_workers(&mut self, workers: usize) {
         for i in 0..workers {
-            let shared_tx = self.tx.clone();
+            let shared_tx = self.tx.as_ref().unwrap().clone();
             let shared_peers = self.peers.clone();
             let torrent = self.torrent.clone();
             let shared_act_pos = self.actual_position.clone();
@@ -113,6 +114,35 @@ impl BitTorrentClient {
                 connector.start();
             });
         }
+    }
+
+    fn start_manager_worker(&mut self) {
+        let torrent = self.torrent.clone();
+        let act_pos = self.actual_position.clone();
+
+        let (tx, rx) = mpsc::channel();
+        self.tx = Some(tx);
+
+        std::thread::spawn(move||{
+            let mut act_pos_ = -1;
+            loop{
+                match rx.recv() {
+                    Ok(piece) => {
+                        {
+                            act_pos_ = *(act_pos.lock().unwrap());
+                        }
+                        if piece.piece_idx == (act_pos_ as i32) || act_pos_ == -1 {
+                            // TODO: send to TCP client
+                            println!("[M] Received piece {}", piece.piece_idx);
+                            {
+                                *(act_pos.lock().unwrap()) = (piece.piece_idx as i64) + 1;
+                            }
+                        }
+                    },
+                    Err(e) => { println!("[M] ERROR: {}", e) },
+                }
+            }
+        });
     }
 }
 
@@ -147,6 +177,7 @@ impl BitTorrentPacket {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct FullPiece {
     piece_idx: i32,
     data: Vec<u8>,
@@ -175,7 +206,7 @@ fn new_piece_from_bytes(data: Vec<u8>, piece_len: usize) -> Piece {
 pub struct PeerConnector {
     torrent: torrent::Torrent,
     peers: Arc<Mutex<Vec<dht::Peer>>>,
-    send_chan: Sender<Piece>,
+    send_chan: Sender<FullPiece>,
     actual_peer: Option<dht::Peer>,
 
     actual_position: i64,
@@ -184,7 +215,7 @@ pub struct PeerConnector {
     socket: Option<TcpStream>,
 }
 
-pub fn new_connector(t: torrent::Torrent, peers: Arc<Mutex<Vec<dht::Peer>>>, chan: Sender<Piece>, act_pos: Arc<Mutex<i64>>) -> PeerConnector {
+pub fn new_connector(t: torrent::Torrent, peers: Arc<Mutex<Vec<dht::Peer>>>, chan: Sender<FullPiece>, act_pos: Arc<Mutex<i64>>) -> PeerConnector {
     PeerConnector{
         torrent: t,
         peers: peers,
@@ -210,8 +241,8 @@ impl PeerConnector {
                 //println!("Worker selected peer: {:?}", self.actual_peer);
                 if let Ok(_) = self.connect(self.actual_peer.unwrap()) {
                     match self.start_download() {
-                        Ok(_) => { println!("download finished for some reason... {:?}", self.actual_peer); }
-                        Err(e) => { println!("ERROR WORKER: {} ({:?})", e, self.actual_peer); }
+                        Ok(_) => { println!("[W] download finished for some reason... {:?}", self.actual_peer); }
+                        Err(e) => { println!("[W] ERROR: {} ({:?})", e, self.actual_peer); }
                     }
                 } else {
                     // TODO: maybe flag?
@@ -304,11 +335,14 @@ impl PeerConnector {
                                 received_chunks += 1;
                                 if received_chunks >= (piece_chunks as _) {
                                     // last chunk, we must remove the signature from the video payload
-                                    println!("Received full piece ({}) from {:?} (chunklen={})", piece.piece_idx, self.actual_peer, piece.data.len());
+                                    println!("[W] Received full piece ({}) from {:?}", piece.piece_idx, self.actual_peer);
                                     last_piece.data.extend_from_slice(&piece.data[..piece.data.len()-0x60]);
                                     // TODO: send to pieces channel (and receive in another thread)
+                                    last_piece.piece_idx = piece.piece_idx;
+                                    self.send_chan.send(last_piece.clone());
                                     self.actual_position += 1;
                                     requested_piece = false;
+                                    received_chunks = 0;
                                 } else {
                                     //println!("Received chunk {}/{} (piece:{}) from {:?} (chunklen={})", piece.chunk_idx, piece_chunks, piece.piece_idx, self.actual_peer, piece.data.len());
                                     last_piece.data.extend_from_slice(&piece.data);
@@ -337,6 +371,7 @@ impl PeerConnector {
                         }
                         self.request_piece(self.actual_position);
                         requested_piece = true;
+                        received_chunks = 0;
                         last_piece.data.clear();
                     }
                 },
@@ -371,6 +406,9 @@ impl PeerConnector {
                     let mut packet = packet_from_header(header.to_vec());
                     if packet.length > 100000 || packet.length < 0 {
                         return Err(format!("bad_packet_len:{}", packet.length).to_string());
+                    } else if packet.length == 0 {
+                        // ping packet
+                        return Ok(packet);
                     }
                     const BUF_SIZE: usize = 5000;
                     let mut buff = [0u8; BUF_SIZE];
