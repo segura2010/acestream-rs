@@ -73,10 +73,11 @@ impl BitTorrentClient {
         loop{
             println!("Updating peers..");
             self.dht.recv_peers();
-            println!("Peers: {:?} (len={})", self.dht.peers, self.dht.peers.len());
-            println!("Nodes: {:?}", self.dht.nodes.len());
-            if !self.started_workers && self.dht.peers.len() > 2 {
+            println!("Peers: {}", self.dht.peers.len());
+            println!("Nodes: {}", self.dht.nodes.len());
+            if !self.started_workers && self.dht.peers.len() >= 2 {
                 self.start_workers(workers);
+                self.started_workers = true;
                 // TODO: create new thread to receive pieces from workers
             } else if i == self.dht.nodes.len() {
                 self.dht.get_peers(&infohash);
@@ -109,6 +110,7 @@ impl BitTorrentClient {
     }
 }
 
+#[derive(Debug)]
 pub struct BitTorrentPacket {
     length: i32,
     id: u8,
@@ -139,6 +141,10 @@ impl BitTorrentPacket {
     }
 }
 
+pub struct FullPiece {
+    piece_idx: i32,
+    data: Vec<u8>,
+}
 pub struct Piece {
     unknown1: i32,
     piece_idx: i32,
@@ -147,6 +153,20 @@ pub struct Piece {
     data: Vec<u8>,
 }
 // TODO: fn new piece from bytes
+fn new_piece_from_bytes(data: Vec<u8>, piece_len: usize) -> Piece {
+    let mut cursor = Cursor::new(data);
+    let mut buff: Vec<u8> = Vec::with_capacity(piece_len);
+    let mut p = Piece{
+        unknown1: cursor.read_i32::<BigEndian>().unwrap(),
+        piece_idx: cursor.read_i32::<BigEndian>().unwrap(),
+        unknown2: cursor.read_i64::<BigEndian>().unwrap(),
+        chunk_idx: cursor.read_i16::<BigEndian>().unwrap(),
+        data: vec![],
+    };
+    cursor.read(&mut buff);
+    p.data = buff;
+    p
+}
 
 pub struct PeerConnector {
     torrent: torrent::Torrent,
@@ -183,9 +203,12 @@ impl PeerConnector {
             }
             if let Some(p) = peers.choose(&mut rng) {
                 self.actual_peer = Some(*p);
-                println!("Worker selected peer: {:?}", self.actual_peer);
+                //println!("Worker selected peer: {:?}", self.actual_peer);
                 if let Ok(_) = self.connect(self.actual_peer.unwrap()) {
-                    self.start_download();
+                    match self.start_download() {
+                        Ok(_) => { println!("download finished for some reason... {:?}", self.actual_peer); }
+                        Err(e) => { println!("ERROR WORKER: {} ({:?})", e, self.actual_peer); }
+                    }
                 } else {
                     // TODO: maybe flag?
                     continue;
@@ -204,13 +227,12 @@ impl PeerConnector {
             }
         }
         self.send_peer_id();
-        self.recv_peer_id();
 
         // receive EXTEND_INFO
         match self.recv() {
             Ok(pkt) => {
                 if pkt.id == CMD_EXTEND_INFO {
-                    match from_bytes::<InitialExtendInfo>(&pkt.data.unwrap()) {
+                    match from_bytes::<InitialExtendInfo>(&pkt.data.unwrap()[1..]) {
                         Ok(info) => {
                             self.actual_position = info.mi.max_piece;
                             println!("Received actual position: {} (from: {:?})", self.actual_position, self.actual_peer);
@@ -246,17 +268,14 @@ impl PeerConnector {
         }
 
         // some set up to start the pieces download
-        let mut last_piece = Piece{
-            unknown1: 0,
+        let mut last_piece = FullPiece{
             piece_idx: 0,
-            unknown2: 0,
-            chunk_idx: 0,
             data: Vec::with_capacity(self.torrent.piece_length - 0x60), // -0x60 -> signature in the last chunk is 0x60 bytes long
         };
         let mut last_piece_time = std::time::Instant::now();
         let piece_chunks = self.torrent.piece_length / self.torrent.chunk_length;
         let mut received_chunks = 0;
-        let mut requested_piece = true;
+        let mut requested_piece = false;
         // update bittorrent client position if it is very old or -1 (not started)
         {
             let mut client_pos = self.actual_position_client.lock().unwrap();
@@ -267,9 +286,55 @@ impl PeerConnector {
             }
         }
 
-        // TODO: download loop
+        loop{
+            match self.recv() {
+                Ok(packet) => {
+                    match packet.id {
+                        CMD_PIECE => {
+                            if let Some(packet_data) = packet.data {
+                                let piece = new_piece_from_bytes(packet_data.clone(), packet_data.len() - 18);
+                                if piece.chunk_idx != received_chunks {
+                                    continue;
+                                }
+                                received_chunks += 1;
+                                if received_chunks >= (piece_chunks as _) {
+                                    // last chunk, we must remove the signature from the video payload
+                                    last_piece.data.extend_from_slice(&piece.data.as_slice()[..piece.data.len()-0x60]);
+                                    println!("Received full piece ({}) from {:?}", piece.piece_idx, self.actual_peer);
+                                    // TODO: send to pieces channel (and receive in another thread)
+                                } else {
+                                    last_piece.data.extend_from_slice(&piece.data);
+                                }
+                            }
+                        },
+                        CMD_EXTEND_INFO_11 => {
+                        },
+                        _ => {
+                        },
+                    }
 
-        Err("unimplemented".to_string())
+                    let elapsed_since_last_piece = last_piece_time.elapsed().as_secs();
+                    if elapsed_since_last_piece > 3 {
+                        requested_piece = false;
+                        last_piece_time = std::time::Instant::now();
+                    }
+                    if !requested_piece {
+                        {
+                            let act_pos_client = self.actual_position_client.lock().unwrap();
+                            if *act_pos_client != -1 {
+                                self.actual_position = *act_pos_client;
+                            }
+                        }
+                        self.request_piece(self.actual_position);
+                        requested_piece = true;
+                        last_piece.data.clear();
+                    }
+                },
+                Err(e) => {
+                    return Err(format!("error_video_download:{}", e.to_string()).to_string());
+                },
+            }
+        }
     }
 
     fn connect(&mut self, peer: dht::Peer) -> Result<usize, String> {
@@ -278,7 +343,7 @@ impl PeerConnector {
         match conn {
             Ok(s) => {
                 s.set_read_timeout(Some(std::time::Duration::from_millis(5000)));
-                s.set_write_timeout(Some(std::time::Duration::from_millis(2000)));
+                s.set_write_timeout(Some(std::time::Duration::from_millis(4500)));
                 self.socket = Some(s);
                 return Ok(1);
             },
@@ -301,7 +366,7 @@ impl PeerConnector {
                     let mut payload = Vec::with_capacity(packet.length as _);
                     let mut read_bytes = 0usize;
                     loop {
-                        if read_bytes >= (packet.length as _){
+                        if read_bytes >= ((packet.length-1) as _){
                             break;
                         }
                         match socket.read(&mut buff) {
@@ -427,8 +492,8 @@ struct InitialExtendInfo {
     lsp: i64,
     v: i64,
     nt: i64,
-    opts: i64,
-    yourip: Vec<u8>,
+    opts: Option<i64>,
+    yourip: ByteBuf,
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct InitialExtendInfoMI {
@@ -480,13 +545,29 @@ fn new_initial_extend_info_packet(peer_addr: &[u8]) -> BitTorrentPacket {
         lsp: 284912,
         v: version_code,
         nt: 1,
-        opts: 15,
-        yourip: peer_addr.to_vec(),
+        opts: Some(15),
+        yourip: ByteBuf::from(peer_addr.to_vec()),
     };
+
+    let mut final_payload = vec![0]; // extend_info type is one byte !!
+    final_payload.extend_from_slice(&payload.to_bencode().unwrap());
 
     BitTorrentPacket{
         id: CMD_EXTEND_INFO,
         length: 0,
-        data: Some(payload.to_bencode().unwrap()),
+        data: Some(final_payload),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bdecode_extend_info_works() {
+        const INPUT: [u8; 519] = [100,50,48,58,97,99,101,95,109,101,116,97,100,97,116,97,95,118,101,114,115,105,111,110,105,49,101,49,51,58,103,101,111,105,112,95,99,111,117,110,116,114,121,50,58,69,83,51,58,108,115,112,105,49,49,53,51,50,56,101,49,58,109,100,49,49,58,117,116,95,109,101,116,97,100,97,116,97,105,50,101,101,50,58,109,105,100,50,48,58,100,105,115,116,97,110,99,101,95,102,114,111,109,95,115,111,117,114,99,101,105,48,101,57,58,100,111,119,110,95,114,97,116,101,105,53,57,50,49,55,49,101,49,57,58,100,111,119,110,108,111,97,100,95,119,105,110,100,111,119,95,101,110,100,105,49,49,53,51,50,56,101,49,51,58,105,115,95,97,99,99,101,115,115,105,98,108,101,105,49,101,49,54,58,108,105,118,101,95,119,105,110,100,111,119,95,115,105,122,101,105,49,49,48,101,51,58,108,115,112,105,49,49,53,51,50,56,101,51,58,109,97,109,105,45,49,101,57,58,109,97,120,95,112,105,101,99,101,105,49,49,53,51,50,55,101,57,58,109,105,110,95,112,105,101,99,101,105,49,49,52,55,51,50,101,57,58,112,101,101,114,95,116,121,112,101,105,48,101,49,54,58,112,105,110,103,95,102,114,111,109,95,115,111,117,114,99,101,105,48,101,56,58,112,111,115,105,116,105,111,110,105,49,49,53,51,49,54,101,49,54,58,116,105,109,101,95,102,114,111,109,95,115,111,117,114,99,101,105,45,49,101,49,57,58,116,111,112,95,115,101,115,115,105,111,110,95,117,112,95,114,97,116,101,105,50,50,54,53,57,48,53,101,49,49,58,116,111,112,95,117,112,95,114,97,116,101,105,50,50,51,55,55,51,54,101,55,58,117,112,95,114,97,116,101,105,52,53,49,55,53,101,49,51,58,117,112,108,111,97,100,95,114,97,116,105,110,103,105,48,101,101,50,58,110,116,105,49,101,49,58,112,105,56,54,50,49,101,56,58,112,108,97,116,102,111,114,109,105,51,101,50,58,112,118,105,50,101,50,58,116,115,105,49,54,51,50,57,49,55,49,52,55,101,50,58,116,116,50,58,98,116,49,58,118,105,51,48,49,54,55,48,49,101,54,58,121,111,117,114,105,112,52,58,87,219,33,178,101];
+        let resp = serde_bencode::de::from_bytes::<crate::acestream::bittorrent::InitialExtendInfo>(&INPUT).unwrap();
+        println!("Extend info: {:?}", resp);
+
+        let ok = resp.tt.eq("bt") && (resp.p == 8621);
+        assert_eq!(ok, true);
     }
 }
