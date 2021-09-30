@@ -94,7 +94,7 @@ impl BitTorrentClient {
 
             old_nodes_len = self.dht.nodes.len();
             i += 1;
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            //std::thread::sleep(std::time::Duration::from_millis(300));
         }
     }
 
