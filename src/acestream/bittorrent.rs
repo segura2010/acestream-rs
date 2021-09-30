@@ -45,9 +45,10 @@ pub struct BitTorrentClient {
     actual_position: Arc<Mutex<i64>>,
     
     tx: Option<Sender<FullPiece>>,
+    tx_out: Option<Sender<FullPiece>>,
 }
 
-pub fn new_client(t: torrent::Torrent) -> BitTorrentClient {
+pub fn new_client(t: torrent::Torrent, tx_out: Option<Sender<FullPiece>>) -> BitTorrentClient {
     BitTorrentClient{
         torrent: t,
         dht: dht::new_default(),
@@ -55,6 +56,7 @@ pub fn new_client(t: torrent::Torrent) -> BitTorrentClient {
         started_workers: false,
         actual_position: Arc::new(Mutex::new(-1)),
         tx: None,
+        tx_out: tx_out,
     }
 }
 
@@ -64,9 +66,6 @@ impl BitTorrentClient {
         self.dht.infohash = infohash.as_slice().to_vec();
         self.dht.listen(format!("0.0.0.0:{}", DHT_PORT));
 
-        //let (tx, rx) = mpsc::channel();
-        //self.tx = Some(tx);
-
         self.dht.get_peers(&infohash);
         let mut old_peers_len = self.dht.peers.len();
         let mut old_nodes_len = self.dht.nodes.len();
@@ -74,18 +73,13 @@ impl BitTorrentClient {
         println!("Updating peers..");
         loop{
             self.dht.recv_peers();
-            if old_peers_len != self.dht.peers.len() {
-                println!("Peers: {}", self.dht.peers.len());
-            }
-            if old_nodes_len != self.dht.nodes.len() {
-                old_nodes_len = self.dht.nodes.len();
-                println!("Nodes: {}", self.dht.nodes.len());
+            if old_peers_len != self.dht.peers.len() || old_nodes_len != self.dht.nodes.len() {
+                println!("Peers: {} // Nodes: {}", self.dht.peers.len(), self.dht.nodes.len());
             }
             if !self.started_workers && self.dht.peers.len() >= 2 {
                 self.start_manager_worker();
                 self.start_workers(workers);
                 self.started_workers = true;
-                // TODO: create new thread to receive pieces from workers
             } else if i == self.dht.nodes.len() {
                 self.dht.get_peers(&infohash);
                 i = 0;
@@ -97,6 +91,8 @@ impl BitTorrentClient {
                 }
                 old_peers_len = self.dht.peers.len();
             }
+
+            old_nodes_len = self.dht.nodes.len();
             i += 1;
             std::thread::sleep(std::time::Duration::from_millis(300));
         }
@@ -119,6 +115,7 @@ impl BitTorrentClient {
     fn start_manager_worker(&mut self) {
         let torrent = self.torrent.clone();
         let act_pos = self.actual_position.clone();
+        let tx_out = self.tx_out.clone();
 
         let (tx, rx) = mpsc::channel();
         self.tx = Some(tx);
@@ -132,10 +129,12 @@ impl BitTorrentClient {
                             act_pos_ = *(act_pos.lock().unwrap());
                         }
                         if piece.piece_idx == (act_pos_ as i32) || act_pos_ == -1 {
-                            // TODO: send to TCP client
-                            println!("[M] Received piece {}", piece.piece_idx);
+                            println!("[M] Received piece {} (len={})", piece.piece_idx, piece.data.len());
                             {
                                 *(act_pos.lock().unwrap()) = (piece.piece_idx as i64) + 1;
+                            }
+                            if let Some(ref tx_out) = tx_out {
+                                tx_out.send(piece);
                             }
                         }
                     },
@@ -179,8 +178,8 @@ impl BitTorrentPacket {
 
 #[derive(Debug, Clone)]
 pub struct FullPiece {
-    piece_idx: i32,
-    data: Vec<u8>,
+    pub piece_idx: i32,
+    pub data: Vec<u8>,
 }
 pub struct Piece {
     unknown1: i32,
@@ -189,7 +188,6 @@ pub struct Piece {
     chunk_idx: i16,
     data: Vec<u8>,
 }
-// TODO: fn new piece from bytes
 fn new_piece_from_bytes(data: Vec<u8>, piece_len: usize) -> Piece {
     let mut cursor = Cursor::new(data);
     let mut p = Piece{
@@ -231,7 +229,6 @@ impl PeerConnector {
     pub fn start(&mut self) {
         let mut rng = rand::thread_rng();
         loop{
-            // TODO: choose random peer, connect, start download
             let peers: Vec<dht::Peer>;
             {
                 peers = self.peers.lock().unwrap().clone();
@@ -337,7 +334,6 @@ impl PeerConnector {
                                     // last chunk, we must remove the signature from the video payload
                                     println!("[W] Received full piece ({}) from {:?}", piece.piece_idx, self.actual_peer);
                                     last_piece.data.extend_from_slice(&piece.data[..piece.data.len()-0x60]);
-                                    // TODO: send to pieces channel (and receive in another thread)
                                     last_piece.piece_idx = piece.piece_idx;
                                     self.send_chan.send(last_piece.clone());
                                     self.actual_position += 1;
