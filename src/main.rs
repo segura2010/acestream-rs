@@ -7,8 +7,7 @@ mod server;
 
 use clap::{App, Arg};
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args = clap::App::new("acestream-rs")
                 .version("0.1")
                 .arg(clap::Arg::with_name("torrent")
@@ -40,7 +39,7 @@ async fn main() {
 
     let mut torrent: Option<acestream::torrent::Torrent> = None;
     if player_id.len() > 0 {
-        match acestream::utils::torrent_from_player_id(player_id.to_string()).await {
+        match acestream::utils::torrent_from_player_id(player_id.to_string()) {
             Ok(t) => {
                 torrent = Some(t);
             },
@@ -49,7 +48,7 @@ async fn main() {
             }
         }
     } else if torrent_file.len() > 0 {
-        match acestream::utils::torrent_from_encrypted_torrentfile(torrent_file.to_string()).await {
+        match acestream::utils::torrent_from_encrypted_torrentfile(torrent_file.to_string()) {
             Ok(t) => {
                 torrent = Some(t);
             },
