@@ -62,8 +62,8 @@ pub fn new_client(t: torrent::Torrent, tx_out: Option<Sender<FullPiece>>) -> Bit
 
 impl BitTorrentClient {
     pub fn start(&mut self, workers: usize) {
-        let infohash = hex::decode(self.torrent.infohash.as_str().to_string()).unwrap();
-        self.dht.infohash = infohash.as_slice().to_vec();
+        let infohash = hex::decode(self.torrent.infohash.clone()).unwrap();
+        self.dht.infohash = infohash.clone();
         self.dht.listen(format!("0.0.0.0:{}", DHT_PORT));
 
         self.dht.get_peers(&infohash);
@@ -463,7 +463,7 @@ impl PeerConnector {
             payload.write_u8(0x11);
             payload.write(b"AceStreamProtocol");
             payload.write_i64::<BigEndian>(0);
-            payload.write(&hex::decode(self.torrent.infohash.as_str().to_string()).unwrap());
+            payload.write(&hex::decode(self.torrent.infohash.clone()).unwrap());
 
             let result = s.write(&payload);
             match result {

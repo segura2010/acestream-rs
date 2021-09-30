@@ -25,18 +25,18 @@ pub struct Torrent {
 impl Torrent {
     pub fn clone(&self) -> Torrent {
         Torrent {
-            player_id: self.player_id.as_str().to_string(),
-            infohash: self.infohash.as_str().to_string(),
-            encrypted_sha1: self.encrypted_sha1.as_str().to_string(),
-            name: self.name.as_str().to_string(),
+            player_id: self.player_id.clone(),
+            infohash: self.infohash.clone(),
+            encrypted_sha1: self.encrypted_sha1.clone(),
+            name: self.name.clone(),
             piece_length: self.piece_length,
             chunk_length: self.chunk_length,
             bitrate: self.bitrate,
-            authmethod: self.authmethod.as_str().to_string(),
-            quality: self.quality.as_str().to_string(),
-            trackers: self.trackers.as_slice().to_vec(),
+            authmethod: self.authmethod.clone(),
+            quality: self.quality.clone(),
+            trackers: self.trackers.clone(),
             pubkey: self.pubkey.clone(),
-            categories: self.categories.as_slice().to_vec(),
+            categories: self.categories.clone(),
         }
     }
 }

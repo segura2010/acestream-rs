@@ -121,8 +121,8 @@ fn new_getpeersrequest(tid: i32, node_id: Vec<u8>, infohash: Vec<u8>) -> GetPeer
         ro: 1,
         y: "q".to_string(),
         a: GetPeersRequestTrasaction{
-            id: node_id.as_slice().to_vec(),
-            info_hash: infohash.as_slice().to_vec(),
+            id: node_id.clone(),
+            info_hash: infohash.clone(),
             want: vec!["n4".to_string()] // nodes IPv6, "n6".to_string()], 
         },
     }
@@ -189,12 +189,12 @@ impl DHTManager {
     pub fn get_peers(&mut self, infohash: &[u8]) {
         if let Some(socket) = &self.socket {
             for r in self.routers.iter(){
-                let msg = new_getpeersrequest(self.transaction_id, self.node_id.as_slice().to_vec(), infohash.to_vec());
+                let msg = new_getpeersrequest(self.transaction_id, self.node_id.clone(), infohash.to_vec());
                 self.transaction_id += 1;
                 socket.send_to(&msg.to_bencode().unwrap(), r);
             }
             for n in self.nodes.iter(){
-                let msg = new_getpeersrequest(self.transaction_id, self.node_id.as_slice().to_vec(), infohash.to_vec());
+                let msg = new_getpeersrequest(self.transaction_id, self.node_id.clone(), infohash.to_vec());
                 self.transaction_id += 1;
                 let addr = SocketAddr::from((n.ip, n.port));
                 socket.send_to(&msg.to_bencode().unwrap(), addr);
@@ -216,7 +216,7 @@ impl DHTManager {
                             let inserted = self.nodes.insert(n);
                             if inserted {
                                 // query new nodes :)
-                                let msg = new_getpeersrequest(self.transaction_id, self.node_id.as_slice().to_vec(), self.infohash.as_slice().to_vec());
+                                let msg = new_getpeersrequest(self.transaction_id, self.node_id.clone(), self.infohash.clone());
                                 self.transaction_id += 1;
                                 socket.send_to(&msg.to_bencode().unwrap(), SocketAddr::from((ip, port)));
                             }
