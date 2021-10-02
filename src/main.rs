@@ -30,12 +30,18 @@ fn main() {
                     .help("Output server port")
                     .required(false)
                     .takes_value(true))
+                .arg(clap::Arg::with_name("http")
+                    .long("http")
+                    .help("HTTP as output server")
+                    .required(false)
+                    .takes_value(false))
                 .get_matches();
     
     let torrent_file = args.value_of("torrent").unwrap_or("");
     let player_id = args.value_of("playerid").unwrap_or("");
     let workers: usize = args.value_of("workers").unwrap_or("6").parse().unwrap();
     let port: u16 = args.value_of("port").unwrap_or("4000").parse().unwrap();
+    let use_http: bool = args.is_present("http");
 
     let mut torrent: Option<acestream::torrent::Torrent> = None;
     if player_id.len() > 0 {
@@ -60,10 +66,18 @@ fn main() {
         panic!("ERROR: Provide torrent or player ID!");
     }
 
-    // start raw TCP server to serve video pieces
-    let mut out_server = server::tcp::new_tcpserver();
-    out_server.run_forever(port);
-    let tx = out_server.get_tx();
+    let mut tx: std::sync::mpsc::Sender<acestream::bittorrent::FullPiece>;
+    if use_http {
+        // TODO: not working (only VLC..)
+        let mut out_server = server::http::OutHttpServer::new();
+        out_server.run_forever(port);
+        tx = out_server.get_tx();
+    } else {
+        // start raw TCP server to serve video pieces
+        let mut out_server = server::tcp::OutTcpServer::new();
+        out_server.run_forever(port);
+        tx = out_server.get_tx();
+    }
 
     // everything OK
     if let Some(t) = torrent {

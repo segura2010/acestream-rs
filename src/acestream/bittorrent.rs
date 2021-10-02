@@ -268,7 +268,7 @@ impl PeerConnector {
                     match from_bytes::<InitialExtendInfo>(&pkt.data.unwrap()[1..]) {
                         Ok(info) => {
                             self.actual_position = info.mi.max_piece;
-                            println!("Received actual position: {} (from: {:?})", self.actual_position, self.actual_peer);
+                            println!("[W] Received actual position: {} (from: {:?})", self.actual_position, self.actual_peer);
                         },
                         Err(e) => {
                             return Err(format!("error_bdecoding_extend_info:{}", e).to_string());

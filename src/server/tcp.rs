@@ -8,19 +8,16 @@ use std::sync::mpsc;
 use std::sync::mpsc::{Sender, Receiver};
 
 pub struct OutTcpServer {
-    client: Option<TcpStream>,
-
     pub tx: Option<Sender<bittorrent::FullPiece>>,
 }
 
-pub fn new_tcpserver() -> OutTcpServer {
-    OutTcpServer{
-        client: None,
-        tx: None,
-    }
-}
-
 impl OutTcpServer {
+    pub fn new() -> Self {
+        Self{
+            tx: None,
+        }
+    }
+
     pub fn get_tx(&self) -> Sender<bittorrent::FullPiece> {
         self.tx.as_ref().unwrap().clone()
     }
