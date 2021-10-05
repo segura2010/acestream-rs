@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "acelib_android"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
 
 [dependencies]
 aes = "0.6.0"
@@ -21,3 +25,4 @@ clap = "2.33.3"
 resolve = "0.2.0"
 byteorder = "1.4.3"
 rand = "0.8.4"
+openssl = { version = "0.10.29", features = ["vendored"] }
