@@ -4,19 +4,10 @@ mod utils;
 mod bittorrent;
 mod server;
 
-pub fn play_acestream_with_playerid(player_id: String, port: String, workers: usize) -> bool {
+pub fn play_acestream_with_playerid(player_id: String, port: u16, workers: usize) {
     let mut torrent: Option<acestream::torrent::Torrent> = None;
     if player_id.len() > 0 {
         match acestream::utils::torrent_from_player_id(player_id.to_string()) {
-            Ok(t) => {
-                torrent = Some(t);
-            },
-            Err(e) => {
-                panic!(e)
-            }
-        }
-    } else if torrent_file.len() > 0 {
-        match acestream::utils::torrent_from_encrypted_torrentfile(torrent_file.to_string()) {
             Ok(t) => {
                 torrent = Some(t);
             },
@@ -31,7 +22,7 @@ pub fn play_acestream_with_playerid(player_id: String, port: String, workers: us
     // start raw TCP server to serve video pieces
     let mut out_server = server::tcp::OutTcpServer::new();
     out_server.run_forever(port);
-    tx = out_server.get_tx();
+    let tx = out_server.get_tx();
 
     if let Some(t) = torrent {
         println!("{:?}", t);
@@ -41,9 +32,9 @@ pub fn play_acestream_with_playerid(player_id: String, port: String, workers: us
 }
 
 // compile with: cargo ndk -t armeabi-v7a -t arm64-v8a build --lib --release
-// for OpenSSL cross-compilation: https://docs.rs/crate/openssl-sys/0.9.19
+// possible targets: armeabi-v7a arm64-v8a x86 x86_64
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub fn play_acestream(id: String) -> bool {
-    lib::play_acestream_with_playerid(id, 4000, 5)
+pub fn play_acestream(id: String) {
+    play_acestream_with_playerid(id, 4000, 5)
 }
