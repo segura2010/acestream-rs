@@ -4,6 +4,10 @@ mod utils;
 mod bittorrent;
 mod server;
 
+use jni::JNIEnv;
+use jni::objects::{JClass, JString};
+use jni::sys::{jstring};
+
 pub fn play_acestream_with_playerid(player_id: String, port: u16, workers: usize) {
     let mut torrent: Option<acestream::torrent::Torrent> = None;
     if player_id.len() > 0 {
@@ -35,6 +39,7 @@ pub fn play_acestream_with_playerid(player_id: String, port: u16, workers: usize
 // possible targets: armeabi-v7a arm64-v8a x86 x86_64
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub fn play_acestream(id: String) {
-    play_acestream_with_playerid(id, 4000, 5)
+pub fn Java_org_videolan_vlc_gui_network_playacestream(env: JNIEnv, _: JClass, player_id: JString) {
+    let p_id: String = env.get_string(player_id).expect("invalid pattern string").into();
+    play_acestream_with_playerid(p_id, 4000, 5)
 }

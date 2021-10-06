@@ -9,6 +9,10 @@ name = "acelib_android"
 path = "src/lib.rs"
 crate-type = ["cdylib"]
 
+[target.'cfg(target_os="android")'.dependencies]
+jni = { version = "0.5", default-features = false }
+openssl = { version = "0.10.29", features = ["vendored"] }
+
 [dependencies]
 aes = "0.6.0"
 hex-literal = "0.3.1"
@@ -25,4 +29,3 @@ clap = "2.33.3"
 resolve = "0.2.0"
 byteorder = "1.4.3"
 rand = "0.8.4"
-openssl = { version = "0.10.29", features = ["vendored"] }
