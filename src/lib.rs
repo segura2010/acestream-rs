@@ -4,10 +4,6 @@ mod utils;
 mod bittorrent;
 mod server;
 
-use jni::JNIEnv;
-use jni::objects::{JClass, JString};
-use jni::sys::{jstring};
-
 pub fn play_acestream_with_playerid(player_id: String, port: u16, workers: usize) {
     let mut torrent: Option<acestream::torrent::Torrent> = None;
     if player_id.len() > 0 {
@@ -35,11 +31,18 @@ pub fn play_acestream_with_playerid(player_id: String, port: u16, workers: usize
     }
 }
 
-// compile with: cargo ndk -t armeabi-v7a -t arm64-v8a build --lib --release
+// compile with: cargo ndk -t armeabi-v7a -t arm64-v8a -o ./target/jniLibs build --lib --release
 // possible targets: armeabi-v7a arm64-v8a x86 x86_64
 #[cfg(target_os = "android")]
-#[no_mangle]
-pub fn Java_org_videolan_vlc_gui_network_playacestream(env: JNIEnv, _: JClass, player_id: JString) {
-    let p_id: String = env.get_string(player_id).expect("invalid pattern string").into();
-    play_acestream_with_playerid(p_id, 4000, 5)
+mod android {
+    use jni::JNIEnv;
+    use jni::objects::{JClass, JString};
+    use jni::sys::{jstring};
+    #[no_mangle]
+    pub fn Java_org_videolan_vlc_gui_network_MRLPanelFragment_playacestream(env: JNIEnv, _: JClass, player_id: JString) {
+        let p_id: String = env.get_string(player_id).expect("invalid pattern string").into();
+        std::thread::spawn(move|| {
+            crate::play_acestream_with_playerid(p_id, 4000, 5);
+        });
+    }
 }

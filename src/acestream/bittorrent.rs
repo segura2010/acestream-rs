@@ -94,7 +94,9 @@ impl BitTorrentClient {
 
             old_nodes_len = self.dht.nodes.len();
             i += 1;
-            //std::thread::sleep(std::time::Duration::from_millis(300));
+            if old_nodes_len > 10000 && old_peers_len > 3 {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
         }
     }
 
