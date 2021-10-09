@@ -81,6 +81,9 @@ impl BitTorrentClient {
                 self.start_workers(workers);
                 self.started_workers = true;
             } else if i == self.dht.nodes.len() {
+                if old_nodes_len > 10000 && old_peers_len > 3 {
+                    std::thread::sleep(std::time::Duration::from_millis(10000));
+                }
                 self.dht.get_peers(&infohash);
                 i = 0;
             }
@@ -94,9 +97,6 @@ impl BitTorrentClient {
 
             old_nodes_len = self.dht.nodes.len();
             i += 1;
-            if old_nodes_len > 10000 && old_peers_len > 3 {
-                std::thread::sleep(std::time::Duration::from_millis(1000));
-            }
         }
     }
 
