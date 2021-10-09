@@ -46,3 +46,19 @@ mod android {
         });
     }
 }
+
+// compile with: cargo lipo --release
+#[cfg(target_os = "ios")]
+mod ios {
+    use std::os::raw::{c_char};
+    use std::ffi::{CString, CStr};
+    #[no_mangle]
+    pub fn playacestream(player_id: *const c_char) {
+        let c_str = unsafe { CStr::from_ptr(player_id) };
+        if let Ok(p_id) = c_str.to_str() {
+            std::thread::spawn(move|| {
+                crate::play_acestream_with_playerid(p_id.to_string(), 4000, 5);
+            });
+        }
+    }
+}
