@@ -240,7 +240,7 @@ impl PeerConnector {
                 //println!("Worker selected peer: {:?}", self.actual_peer);
                 if let Ok(_) = self.connect(self.actual_peer.unwrap()) {
                     match self.start_download() {
-                        Ok(_) => { println!("[W] download finished for some reason... {:?}", self.actual_peer); }
+                        Ok(_) => { println!("[W] Download finished for some reason: {:?}", self.actual_peer); }
                         Err(e) => { println!("[W] ERROR: {} ({:?})", e, self.actual_peer); }
                     }
                 } else {
@@ -401,6 +401,9 @@ impl PeerConnector {
             let mut header = [0u8; 5]; // 4 bytes for length + 1 for message ID
             match socket.read(&mut header[..4]) {
                 Ok(n) => {
+                    if n <= 0 {
+                        return Err("nothing_received".to_string());
+                    }
                     let mut packet = packet_from_header(header.to_vec());
                     if packet.length > 100000 || packet.length < 0 {
                         return Err(format!("bad_packet_len:{}", packet.length).to_string());
