@@ -64,17 +64,20 @@ impl BitTorrentClient {
     pub fn start(&mut self, workers: usize) {
         let infohash = hex::decode(self.torrent.infohash.clone()).unwrap();
         self.dht.infohash = infohash.clone();
-        self.dht.listen(format!("0.0.0.0:{}", DHT_PORT));
+        if let Err(e) = self.dht.listen(format!("0.0.0.0:{}", DHT_PORT)) {
+            println!("[DHT] Error: {}", e);
+            return;
+        }
 
         self.dht.get_peers(&infohash);
         let mut old_peers_len = self.dht.peers.len();
         let mut old_nodes_len = self.dht.nodes.len();
         let mut i = 0;
-        println!("Updating peers..");
+        println!("[DHT] Updating peers..");
         loop{
             self.dht.recv_peers();
             if old_peers_len != self.dht.peers.len() || old_nodes_len != self.dht.nodes.len() {
-                println!("Peers: {} // Nodes: {}", self.dht.peers.len(), self.dht.nodes.len());
+                println!("[DHT] Peers: {} // Nodes: {}", self.dht.peers.len(), self.dht.nodes.len());
             }
             if !self.started_workers && self.dht.peers.len() >= 2 {
                 self.start_manager_worker();
