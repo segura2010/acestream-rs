@@ -11,15 +11,15 @@ pub struct Torrent {
     #[serde(skip)]
     pub encrypted_sha1: String,
 
-    pub name: String,
+    pub name: Option<String>,
     pub piece_length: usize,
     pub chunk_length: usize,
     pub bitrate: usize,
-    pub authmethod: String,
-    pub quality: String,
-    pub trackers: Vec<String>,
+    pub authmethod: Option<String>,
+    pub quality: Option<String>,
+    pub trackers: Option<Vec<String>>,
     pub pubkey: Option<ByteBuf>,
-    pub categories: Vec<String>,
+    pub categories: Option<Vec<String>>,
 }
 
 impl Torrent {
