@@ -1,10 +1,23 @@
+#[macro_use]
+extern crate lazy_static;
+
 mod crypto;
 mod acestream;
 mod utils;
 mod bittorrent;
 mod server;
 
+use std::sync::Mutex;
+
+lazy_static! {
+    pub static ref already_playing: Mutex<bool> = Mutex::new(false);
+}
+
 pub fn play_acestream_with_playerid(player_id: String, port: u16, workers: usize) {
+    if *already_playing.lock().unwrap() {
+        panic!("Already playing content!");
+    }
+
     let mut torrent: Option<acestream::torrent::Torrent> = None;
     if player_id.len() > 0 {
         match acestream::utils::torrent_from_player_id(player_id.to_string()) {
@@ -25,6 +38,7 @@ pub fn play_acestream_with_playerid(player_id: String, port: u16, workers: usize
     let tx = out_server.get_tx();
 
     if let Some(t) = torrent {
+        *already_playing.lock().unwrap() = true;
         println!("{:?}", t);
         let mut bt_client = acestream::bittorrent::new_client(t, Some(tx));
         bt_client.start(workers);

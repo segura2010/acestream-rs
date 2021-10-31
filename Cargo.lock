@@ -14,6 +14,7 @@ dependencies = [
  "hex",
  "hex-literal",
  "jni",
+ "lazy_static",
  "openssl",
  "rand 0.8.4",
  "reqwest",
