@@ -151,6 +151,9 @@ fn generate_random_id(size: usize) -> Vec<u8> {
 
 pub fn new_default() -> DHTManager {
     let mut routers = Vec::with_capacity(20);
+    routers.append(&mut utils::create_dht_router_addr("tracker.opentrackr.org", 1337, true).unwrap());
+    routers.append(&mut utils::create_dht_router_addr("9.rarbg.com", 2810, true).unwrap());
+    routers.append(&mut utils::create_dht_router_addr("tracker.openbittorrent.com", 6969, true).unwrap());
     routers.append(&mut utils::create_dht_router_addr("router.bittorrent.com", 6881, true).unwrap());
     routers.append(&mut utils::create_dht_router_addr("router.utorrent.com", 6881, true).unwrap());
     routers.append(&mut utils::create_dht_router_addr("tracker.coppersurfer.tk", 6969, true).unwrap());
