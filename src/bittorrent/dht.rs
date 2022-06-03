@@ -1,7 +1,7 @@
 
 use crate::utils;
 
-use std::net::{ToSocketAddrs, SocketAddr};
+use std::net::{ToSocketAddrs, SocketAddr, IpAddr};
 use std::collections::hash_set::HashSet;
 
 use serde::{Serialize, Deserialize};
@@ -177,7 +177,7 @@ impl DHTManager {
     pub fn listen(&mut self, binding: String) -> Result<u8, String> {
         match std::net::UdpSocket::bind(binding) {
             Ok(s) => {
-                s.set_read_timeout(Some(std::time::Duration::from_millis(5000)));
+                s.set_read_timeout(Some(std::time::Duration::from_millis(300)));
                 s.set_write_timeout(Some(std::time::Duration::from_millis(1000)));
                 self.socket = Some(s);
                 return Ok(0);

@@ -83,7 +83,7 @@ impl BitTorrentClient {
                 self.start_manager_worker();
                 self.start_workers(workers);
                 self.started_workers = true;
-            } else if i == self.dht.nodes.len() {
+            } else if i >= self.dht.nodes.len() {
                 if self.dht.nodes.len() > 10000 && old_peers_len > 3 {
                     std::thread::sleep(std::time::Duration::from_millis(10000));
                 }
