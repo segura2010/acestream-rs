@@ -61,10 +61,14 @@ pub fn new_client(t: torrent::Torrent, tx_out: Option<Sender<FullPiece>>) -> Bit
 }
 
 impl BitTorrentClient {
-    pub fn start(&mut self, workers: usize) {
+    pub fn start(&mut self, workers: usize, d_port: Option<u16>) {
+        let mut dht_port = DHT_PORT;
+        if let Some(d_port) = d_port {
+            dht_port = d_port;
+        }
         let infohash = hex::decode(self.torrent.infohash.clone()).unwrap();
         self.dht.infohash = infohash.clone();
-        if let Err(e) = self.dht.listen(format!("0.0.0.0:{}", DHT_PORT)) {
+        if let Err(e) = self.dht.listen(format!("0.0.0.0:{}", dht_port)) {
             println!("[DHT] Error: {}", e);
             return;
         }

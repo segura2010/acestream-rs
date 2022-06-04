@@ -35,6 +35,11 @@ fn main() {
                     .help("HTTP as output server")
                     .required(false)
                     .takes_value(false))
+                .arg(clap::Arg::with_name("dport")
+                    .long("dport")
+                    .help("DHT UDP port")
+                    .required(false)
+                    .takes_value(true))
                 .get_matches();
     
     let torrent_file = args.value_of("torrent").unwrap_or("");
@@ -42,6 +47,10 @@ fn main() {
     let workers: usize = args.value_of("workers").unwrap_or("6").parse().unwrap();
     let port: u16 = args.value_of("port").unwrap_or("4000").parse().unwrap();
     let use_http: bool = args.is_present("http");
+    let mut dport: Option<u16> = None;
+    if args.is_present("dport") {
+        dport = Some(args.value_of("dport").unwrap_or("").parse().unwrap());
+    }
 
     let mut torrent: Option<acestream::torrent::Torrent> = None;
     if player_id.len() > 0 {
@@ -83,6 +92,6 @@ fn main() {
     if let Some(t) = torrent {
         println!("{:?}", t);
         let mut bt_client = acestream::bittorrent::new_client(t, Some(tx));
-        bt_client.start(workers);
+        bt_client.start(workers, dport);
     }
 }

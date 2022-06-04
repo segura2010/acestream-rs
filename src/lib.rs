@@ -41,7 +41,7 @@ pub fn play_acestream_with_playerid(player_id: String, port: u16, workers: usize
         *already_playing.lock().unwrap() = true;
         println!("{:?}", t);
         let mut bt_client = acestream::bittorrent::new_client(t, Some(tx));
-        bt_client.start(workers);
+        bt_client.start(workers, None);
     }
 }
 
