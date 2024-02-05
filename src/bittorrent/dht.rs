@@ -149,18 +149,31 @@ fn generate_random_id(size: usize) -> Vec<u8> {
     result
 }
 
+pub enum DHTServer<'a> {
+    DomainNameServer(&'a str, u16),
+    IPServer(&'a str, u16)
+}
+
+const TRACKERS_LIST: [DHTServer; 10] = [
+    DHTServer::DomainNameServer("tracker.opentrackr.org", 1337),
+    DHTServer::DomainNameServer("9.rarbg.com", 2810),
+    DHTServer::DomainNameServer("tracker.openbittorrent.com", 6969),
+    DHTServer::DomainNameServer("router.bittorrent.com", 6881),
+    DHTServer::DomainNameServer("router.utorrent.com", 6881),
+    DHTServer::DomainNameServer("tracker.coppersurfer.tk", 6969),
+    DHTServer::DomainNameServer("dht.transmissionbt.com", 6881),
+    DHTServer::DomainNameServer("dht.aelitis.com", 6881),
+    DHTServer::DomainNameServer("router.silotis.us", 6881),
+    DHTServer::DomainNameServer("dht.libtorrent.org", 25401),
+];
+
 pub fn new_default() -> DHTManager {
     let mut routers = Vec::with_capacity(20);
-    routers.append(&mut utils::create_dht_router_addr("tracker.opentrackr.org", 1337, true).unwrap());
-    //routers.append(&mut utils::create_dht_router_addr("9.rarbg.com", 2810, true).unwrap());
-    routers.append(&mut utils::create_dht_router_addr("tracker.openbittorrent.com", 6969, true).unwrap());
-    routers.append(&mut utils::create_dht_router_addr("router.bittorrent.com", 6881, true).unwrap());
-    routers.append(&mut utils::create_dht_router_addr("router.utorrent.com", 6881, true).unwrap());
-    routers.append(&mut utils::create_dht_router_addr("tracker.coppersurfer.tk", 6969, true).unwrap());
-    routers.append(&mut utils::create_dht_router_addr("dht.transmissionbt.com", 6881, true).unwrap());
-    routers.append(&mut utils::create_dht_router_addr("dht.aelitis.com", 6881, true).unwrap());
-    routers.append(&mut utils::create_dht_router_addr("router.silotis.us", 6881, true).unwrap());
-    routers.append(&mut utils::create_dht_router_addr("dht.libtorrent.org", 25401, true).unwrap());
+    for tracker in TRACKERS_LIST {
+        if let Ok(mut server) = utils::create_dht_router_addr(tracker) {
+            routers.append(&mut server);
+        }
+    }
 
     DHTManager{
         transaction_id: 0,
