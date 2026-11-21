@@ -1,639 +1,737 @@
+//! AceStream flavour of the BitTorrent peer protocol (download only).
+//!
+//! Threads:
+//! * the caller's thread runs the DHT loop and publishes peer snapshots;
+//! * `workers` threads each connect to a random peer and download pieces.
+//!
+//! Completed pieces go through a [`Gate`] that forwards them to the output in
+//! order and without duplicates. Piece buffers are recycled through a small
+//! pool, and every connection parses packets in place from a reusable receive
+//! buffer, so the steady state performs no per-packet allocations and copies
+//! each video byte exactly once (socket buffer -> piece buffer).
 
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc;
-use std::sync::mpsc::{Sender, Receiver};
-use std::net::{TcpStream, SocketAddr};
-use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
-use std::io::{Write, Read, Cursor};
+use std::convert::Infallible;
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, SocketAddrV4, TcpStream};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use rand::prelude::*;
-use rand::seq::SliceRandom;
-use rand::distributions::Slice;
-
-use serde::{Serialize, Deserialize};
-use serde_bencode::de::from_bytes;
-use serde_bencode::ser::to_bytes;
-use serde_bytes::ByteBuf;
-
-use crate::acestream::torrent;
-use crate::acestream::api;
-use crate::bittorrent::dht;
+use crate::acestream::{api, torrent::Torrent};
+use crate::bencode;
+use crate::bittorrent::dht::{self, DhtManager};
+use crate::utils::Rng;
 
 const DHT_PORT: u16 = 8621;
 const BITTORRENT_PORT: u16 = 8621;
 
-// BitTorrent Protocol Messages IDs
-const CMD_CHOKE: u8 = 0;
-const CMD_UNCHOKE: u8 = 1;
+// BitTorrent protocol message ids used by the client.
 const CMD_INTERESTED: u8 = 2;
-const CMD_NOT_INTERESTED: u8 = 3;
-const CMD_HAVE: u8 = 4;
-const CMD_BITFIELD: u8 = 5;
 const CMD_REQUEST: u8 = 6;
 const CMD_PIECE: u8 = 7;
-const CMD_CANCEL: u8 = 8;
-const CMD_PORT: u8 = 9;
-const CMD_EXTEND_INFO_11: u8 = 11;
 const CMD_EXTEND_INFO: u8 = 0x14;
 
-pub struct BitTorrentClient {
-    torrent: torrent::Torrent,
-    dht: dht::DHTManager,
-    peers: Arc<Mutex<Vec<dht::Peer>>>,
-    started_workers: bool,
+const PROTOCOL_NAME: &[u8; 17] = b"AceStreamProtocol";
+const HANDSHAKE_LEN: usize = 46;
+const PEER_ID_LEN: usize = 20;
+const MAX_PACKET_LEN: i32 = 100_000;
+/// piece index (8) + unknown (8) + chunk index (2)
+const CHUNK_HEADER_LEN: usize = 18;
+/// The last chunk of every piece ends with a signature that is not video.
+const SIGNATURE_LEN: usize = 0x60;
+/// length (4) + id (1) + piece (8) + chunk (2)
+const REQUEST_LEN: usize = 15;
 
-    actual_position: Arc<Mutex<i64>>,
-    
-    tx: Option<Sender<FullPiece>>,
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(2500);
+const READ_TIMEOUT: Duration = Duration::from_millis(5000);
+const WRITE_TIMEOUT: Duration = Duration::from_millis(4500);
+const PIECE_RETRY_SECS: u64 = 3;
+/// A peer further ahead than this (in pieces) resets the playback position.
+const MAX_POSITION_LAG: i64 = 60;
+
+const RECV_BUF_LEN: usize = 64 * 1024;
+/// Compact the receive buffer when less than this is free at its end.
+const MIN_READ_SPACE: usize = 16 * 1024;
+const MAX_POOLED_BUFFERS: usize = 4;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A complete piece, ready to be sent to the player.
+pub struct FullPiece {
+    pub piece_idx: i32,
+    pub data: PieceData,
+}
+
+/// Piece payload. Its buffer goes back to the pool when dropped.
+pub struct PieceData {
+    buf: Vec<u8>,
+    pool: Arc<BufferPool>,
+}
+
+impl Deref for PieceData {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl Drop for PieceData {
+    fn drop(&mut self) {
+        self.pool.put(std::mem::take(&mut self.buf));
+    }
+}
+
+struct BufferPool {
+    free: Mutex<Vec<Vec<u8>>>,
+    buf_capacity: usize,
+}
+
+impl BufferPool {
+    fn take(&self) -> Vec<u8> {
+        lock(&self.free)
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(self.buf_capacity))
+    }
+
+    fn put(&self, mut buf: Vec<u8>) {
+        buf.clear();
+        let mut free = lock(&self.free);
+        if free.len() < MAX_POOLED_BUFFERS {
+            free.push(buf);
+        }
+    }
+}
+
+/// Serialises the hand-off of completed pieces: only the piece the output
+/// expects next (or any piece before playback starts) is forwarded.
+struct Gate {
+    /// Next piece expected by the output, -1 before playback starts. Only
+    /// written while holding `out`; workers read it lock-free.
+    position: AtomicI64,
+    out: Mutex<Option<Sender<FullPiece>>>,
+    pool: Arc<BufferPool>,
+}
+
+impl Gate {
+    fn position(&self) -> i64 {
+        self.position.load(Ordering::Relaxed)
+    }
+
+    /// Called when a connection starts: adopts the peer position when
+    /// playback has not started or lags too far behind. Returns `true` when
+    /// the position was adopted.
+    fn sync_start(&self, peer_position: i64) -> bool {
+        let _guard = lock(&self.out);
+        let current = self.position();
+        if current == -1 || peer_position - current > MAX_POSITION_LAG {
+            self.position.store(peer_position, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Forwards the piece in `buf` if it is the expected one. On success
+    /// `buf` is replaced by an empty buffer from the pool.
+    fn offer(&self, piece_idx: i32, buf: &mut Vec<u8>) {
+        let out = lock(&self.out);
+        let current = self.position();
+        if current != -1 && piece_idx != current as i32 {
+            return;
+        }
+        println!("[M] Received piece {} (len={})", piece_idx, buf.len());
+        self.position.store(piece_idx as i64 + 1, Ordering::Relaxed);
+        let data = PieceData {
+            buf: std::mem::replace(buf, self.pool.take()),
+            pool: self.pool.clone(),
+        };
+        if let Some(tx) = out.as_ref() {
+            let _ = tx.send(FullPiece { piece_idx, data });
+        }
+    }
+}
+
+/// State shared by the DHT loop and all workers.
+struct Shared {
+    infohash: [u8; 20],
+    piece_chunks: usize,
+    peers: Mutex<Arc<Vec<SocketAddrV4>>>,
+    gate: Gate,
+}
+
+pub struct BitTorrentClient {
+    torrent: Torrent,
+    dht: DhtManager,
     tx_out: Option<Sender<FullPiece>>,
 }
 
-pub fn new_client(t: torrent::Torrent, tx_out: Option<Sender<FullPiece>>) -> BitTorrentClient {
-    BitTorrentClient{
-        torrent: t,
+pub fn new_client(torrent: Torrent, tx_out: Option<Sender<FullPiece>>) -> BitTorrentClient {
+    BitTorrentClient {
+        torrent,
         dht: dht::new_default(),
-        peers: Arc::new(Mutex::new(Vec::with_capacity(30))),
-        started_workers: false,
-        actual_position: Arc::new(Mutex::new(-1)),
-        tx: None,
-        tx_out: tx_out,
+        tx_out,
     }
 }
 
 impl BitTorrentClient {
+    /// Runs the DHT loop forever, starting the download workers as soon as
+    /// enough peers are known. Only returns on a fatal setup error.
     pub fn start(&mut self, workers: usize, d_port: Option<u16>) {
-        let mut dht_port = DHT_PORT;
-        if let Some(d_port) = d_port {
-            dht_port = d_port;
+        let Some(infohash) = self.torrent.infohash_bytes() else {
+            println!("[BT] Error: invalid infohash '{}'", self.torrent.infohash);
+            return;
+        };
+        if self.torrent.chunk_length == 0 {
+            println!("[BT] Error: invalid chunk length");
+            return;
         }
-        let infohash = hex::decode(self.torrent.infohash.clone()).unwrap();
-        self.dht.infohash = infohash.clone();
-        if let Err(e) = self.dht.listen(format!("0.0.0.0:{}", dht_port)) {
-            println!("[DHT] Error: {}", e);
+        if let Err(e) = self.dht.listen(d_port.unwrap_or(DHT_PORT), &infohash) {
+            println!("[DHT] Error: {e}");
             return;
         }
 
-        self.dht.get_peers(&infohash);
-        let mut old_peers_len = self.dht.peers.len();
-        let mut old_nodes_len = self.dht.nodes.len();
-        let mut i = 0;
+        let shared = Arc::new(Shared {
+            infohash,
+            piece_chunks: self.torrent.piece_length / self.torrent.chunk_length,
+            peers: Mutex::new(Arc::new(Vec::new())),
+            gate: Gate {
+                position: AtomicI64::new(-1),
+                out: Mutex::new(self.tx_out.take()),
+                pool: Arc::new(BufferPool {
+                    free: Mutex::new(Vec::new()),
+                    buf_capacity: self.torrent.piece_length,
+                }),
+            },
+        });
+
+        self.dht.get_peers();
+        let mut old_peers_len = self.dht.peers_len();
+        let mut old_nodes_len = self.dht.nodes_len();
+        let mut started_workers = false;
+        let mut i = 0usize;
         println!("[DHT] Updating peers..");
-        loop{
+        loop {
             self.dht.recv_peers();
-            if old_peers_len != self.dht.peers.len() || old_nodes_len != self.dht.nodes.len() {
-                println!("[DHT] Peers: {} // Nodes: {}", self.dht.peers.len(), self.dht.nodes.len());
+            let peers_len = self.dht.peers_len();
+            let nodes_len = self.dht.nodes_len();
+            if old_peers_len != peers_len || old_nodes_len != nodes_len {
+                println!("[DHT] Peers: {peers_len} // Nodes: {nodes_len}");
             }
-            if !self.started_workers && self.dht.peers.len() >= 2 {
-                self.start_manager_worker();
-                self.start_workers(workers);
-                self.started_workers = true;
-            } else if i >= self.dht.nodes.len() {
-                if self.dht.nodes.len() > 10000 && old_peers_len > 3 {
-                    std::thread::sleep(std::time::Duration::from_millis(10000));
+            if !started_workers && peers_len >= 2 {
+                // The peer list is published below, so the workers start
+                // after a short pause and spread over the peers found by
+                // then instead of all hitting the first two.
+                start_workers(&shared, workers);
+                started_workers = true;
+            } else if i >= nodes_len {
+                if nodes_len > 10000 && old_peers_len > 3 {
+                    thread::sleep(Duration::from_millis(10000));
                 }
-                self.dht.get_peers(&infohash);
+                self.dht.get_peers();
                 i = 0;
             }
-            if old_peers_len != self.dht.peers.len() {
-                self.peers.lock().unwrap().clear();
-                for p in self.dht.peers.iter() {
-                    self.peers.lock().unwrap().push(*p);
-                }
-                old_peers_len = self.dht.peers.len();
+            if old_peers_len != peers_len {
+                *lock(&shared.peers) = Arc::new(self.dht.peers());
+                old_peers_len = peers_len;
             }
-
-            old_nodes_len = self.dht.nodes.len();
+            old_nodes_len = nodes_len;
             i += 1;
         }
     }
-
-    fn start_workers(&mut self, workers: usize) {
-        for i in 0..workers {
-            let shared_tx = self.tx.as_ref().unwrap().clone();
-            let shared_peers = self.peers.clone();
-            let torrent = self.torrent.clone();
-            let shared_act_pos = self.actual_position.clone();
-
-            std::thread::spawn(move||{
-                let mut connector = new_connector(torrent, shared_peers, shared_tx, shared_act_pos);
-                connector.start();
-            });
-        }
-    }
-
-    fn start_manager_worker(&mut self) {
-        let torrent = self.torrent.clone();
-        let act_pos = self.actual_position.clone();
-        let tx_out = self.tx_out.clone();
-
-        let (tx, rx) = mpsc::channel();
-        self.tx = Some(tx);
-
-        std::thread::spawn(move||{
-            let mut act_pos_ = -1;
-            loop{
-                match rx.recv() {
-                    Ok(piece) => {
-                        {
-                            act_pos_ = *(act_pos.lock().unwrap());
-                        }
-                        if piece.piece_idx == (act_pos_ as i32) || act_pos_ == -1 {
-                            println!("[M] Received piece {} (len={})", piece.piece_idx, piece.data.len());
-                            {
-                                *(act_pos.lock().unwrap()) = (piece.piece_idx as i64) + 1;
-                            }
-                            if let Some(ref tx_out) = tx_out {
-                                tx_out.send(piece);
-                            }
-                        }
-                    },
-                    Err(e) => { println!("[M] ERROR: {}", e) },
-                }
-            }
-        });
-    }
 }
 
-#[derive(Debug)]
-pub struct BitTorrentPacket {
-    length: i32,
-    id: u8,
-    data: Option<Vec<u8>>,
-}
-fn packet_from_header(header: Vec<u8>) -> BitTorrentPacket {
-    let mut cursor = Cursor::new(header);
-    BitTorrentPacket{
-        length: cursor.read_i32::<BigEndian>().unwrap(),
-        id: cursor.read_u8().unwrap(),
-        data: None,
-    }
-}
-impl BitTorrentPacket {
-    fn as_bytes(&self) -> Vec<u8> {
-        if let Some(data) = &self.data {
-            let mut packet = Vec::with_capacity(data.len() + 4 + 1); // len + cmd + payload.len()
-            packet.write_i32::<BigEndian>((data.len() + 1) as _); // cmd + payload.len()
-            packet.write_u8(self.id);
-            packet.write(&data);
-            return packet;
-        } else {
-            let mut packet = Vec::with_capacity(5);
-            packet.write_i32::<BigEndian>(1); // cmd + payload.len()
-            packet.write_u8(self.id);
-            return packet;
+fn start_workers(shared: &Arc<Shared>, workers: usize) {
+    for n in 0..workers {
+        let worker = Worker::new(shared.clone());
+        if let Err(e) = thread::Builder::new()
+            .name(format!("worker-{n}"))
+            .spawn(move || worker.run())
+        {
+            println!("[W] ERROR: unable to start worker: {e}");
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FullPiece {
-    pub piece_idx: i32,
-    pub data: Vec<u8>,
-}
-pub struct Piece {
-    unknown1: i32,
-    piece_idx: i32,
-    unknown2: i64,
-    chunk_idx: i16,
-    data: Vec<u8>,
-}
-fn new_piece_from_bytes(data: Vec<u8>, piece_len: usize) -> Piece {
-    let mut cursor = Cursor::new(data);
-    let mut p = Piece{
-        unknown1: cursor.read_i32::<BigEndian>().unwrap(),
-        piece_idx: cursor.read_i32::<BigEndian>().unwrap(),
-        unknown2: cursor.read_i64::<BigEndian>().unwrap(),
-        chunk_idx: cursor.read_i16::<BigEndian>().unwrap(),
-        data: vec![0u8; piece_len],
-    };
-    cursor.read(&mut p.data);
-    p
+struct Worker {
+    shared: Arc<Shared>,
+    rng: Rng,
+    /// Receive buffer, reused across connections.
+    recv_buf: Vec<u8>,
+    /// Piece being assembled.
+    piece_buf: Vec<u8>,
+    /// Serialised chunk requests of a piece.
+    request_buf: Vec<u8>,
 }
 
-pub struct PeerConnector {
-    torrent: torrent::Torrent,
-    peers: Arc<Mutex<Vec<dht::Peer>>>,
-    send_chan: Sender<FullPiece>,
-    actual_peer: Option<dht::Peer>,
-
-    actual_position: i64,
-    actual_position_client: Arc<Mutex<i64>>,
-
-    socket: Option<TcpStream>,
-}
-
-pub fn new_connector(t: torrent::Torrent, peers: Arc<Mutex<Vec<dht::Peer>>>, chan: Sender<FullPiece>, act_pos: Arc<Mutex<i64>>) -> PeerConnector {
-    PeerConnector{
-        torrent: t,
-        peers: peers,
-        send_chan: chan,
-        actual_peer: None,
-        actual_position: -1,
-        actual_position_client: act_pos,
-        socket: None,
+impl Worker {
+    fn new(shared: Arc<Shared>) -> Self {
+        let piece_buf = shared.gate.pool.take();
+        let request_buf = Vec::with_capacity(shared.piece_chunks * REQUEST_LEN);
+        Worker {
+            shared,
+            rng: Rng::new(),
+            recv_buf: vec![0; RECV_BUF_LEN],
+            piece_buf,
+            request_buf,
+        }
     }
-}
 
-impl PeerConnector {
-    pub fn start(&mut self) {
-        let mut rng = rand::thread_rng();
-        loop{
-            let peers: Vec<dht::Peer>;
-            {
-                peers = self.peers.lock().unwrap().clone();
+    fn run(mut self) {
+        loop {
+            let peers = lock(&self.shared.peers).clone();
+            if !peers.is_empty() {
+                let peer = peers[self.rng.below(peers.len())];
+                let Ok(stream) = TcpStream::connect_timeout(&SocketAddr::V4(peer), CONNECT_TIMEOUT)
+                else {
+                    continue;
+                };
+                let Err(e) = self.download(&stream, peer);
+                println!("[W] ERROR: {e} ({peer})");
             }
-            if let Some(p) = peers.choose(&mut rng) {
-                self.actual_peer = Some(*p);
-                //println!("Worker selected peer: {:?}", self.actual_peer);
-                if let Ok(_) = self.connect(self.actual_peer.unwrap()) {
-                    match self.start_download() {
-                        Ok(_) => { println!("[W] Download finished for some reason: {:?}", self.actual_peer); }
-                        Err(e) => { println!("[W] ERROR: {} ({:?})", e, self.actual_peer); }
-                    }
-                } else {
-                    // TODO: maybe flag?
+            thread::sleep(Duration::from_millis(1000));
+        }
+    }
+
+    /// Runs a download session with `peer`; it only ends on error.
+    fn download(&mut self, stream: &TcpStream, peer: SocketAddrV4) -> Result<Infallible, String> {
+        let Worker {
+            shared,
+            rng,
+            recv_buf,
+            piece_buf,
+            request_buf,
+        } = self;
+        let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+        let _ = stream.set_nodelay(true);
+        let mut conn = Connection {
+            stream,
+            buf: recv_buf,
+            start: 0,
+            end: 0,
+        };
+
+        // Handshake: 0x11 "AceStreamProtocol" 8 reserved bytes, infohash.
+        let mut handshake = [0u8; HANDSHAKE_LEN];
+        handshake[0] = PROTOCOL_NAME.len() as u8;
+        handshake[1..18].copy_from_slice(PROTOCOL_NAME);
+        handshake[26..].copy_from_slice(&shared.infohash);
+        send(stream, &handshake)?;
+        if conn.read_exact(HANDSHAKE_LEN)?[1..18] != PROTOCOL_NAME[..] {
+            return Err("no_acestream_protocol".into());
+        }
+        send(stream, &generate_peer_id(rng))?;
+        conn.read_exact(PEER_ID_LEN)?;
+
+        // The peer announces its live position in its EXTEND_INFO message.
+        let (id, payload) = conn
+            .next_packet()
+            .map_err(|e| format!("error_receiving_extend_info:{e}"))?;
+        if id != CMD_EXTEND_INFO {
+            return Err("error_extend_info_not_recv".into());
+        }
+        let mut actual_position = parse_max_piece(payload)?;
+        println!("[W] Received actual position: {actual_position} (from: {peer})");
+
+        // Our EXTEND_INFO and INTERESTED; the replies are not needed.
+        send(stream, &extend_info_packet(peer.ip().octets()))?;
+        let _ = conn.next_packet();
+        send(stream, &[0, 0, 0, 1, CMD_INTERESTED])?;
+        let _ = conn.next_packet();
+
+        let piece_chunks = shared.piece_chunks;
+        let gate = &shared.gate;
+        let mut requested_piece = false;
+        let mut requested_position = actual_position;
+        let mut received_chunks = 0usize;
+        let mut last_piece_time = Instant::now();
+        piece_buf.clear();
+        if gate.sync_start(actual_position) {
+            encode_piece_request(request_buf, actual_position, piece_chunks);
+            send(stream, request_buf)?;
+        }
+
+        loop {
+            let (id, data) = conn
+                .next_packet()
+                .map_err(|e| format!("error_video_download:{e}"))?;
+            if id == CMD_PIECE && data.len() >= CHUNK_HEADER_LEN {
+                let piece_idx = i32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                let chunk_idx = i16::from_be_bytes([data[16], data[17]]);
+                let chunk = &data[CHUNK_HEADER_LEN..];
+                // Only accept the next chunk of the piece being assembled.
+                if i64::from(chunk_idx) != received_chunks as i64
+                    || piece_idx != requested_position as i32
+                {
                     continue;
                 }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1000));
-        }
-    }
-
-    fn start_download(&mut self) -> Result<usize, String> {
-        self.send_handshake();
-        let handshake = self.recv_handshake()?;
-        if let Ok(client) = String::from_utf8(handshake[1..18].to_vec()) {
-            if client.ne("AceStreamProtocol") {
-                return Err("no_acestream_protocol".to_string());
-            }
-        }
-        self.send_peer_id();
-        self.recv_peer_id();
-
-        // receive EXTEND_INFO
-        match self.recv() {
-            Ok(pkt) => {
-                if pkt.id == CMD_EXTEND_INFO {
-                    match from_bytes::<InitialExtendInfo>(&pkt.data.unwrap()[1..]) {
-                        Ok(info) => {
-                            self.actual_position = info.mi.max_piece;
-                            println!("[W] Received actual position: {} (from: {:?})", self.actual_position, self.actual_peer);
-                        },
-                        Err(e) => {
-                            return Err(format!("error_bdecoding_extend_info:{}", e).to_string());
-                        },
-                    }
-                } else {
-                    return Err("error_extend_info_not_recv".to_string());
+                received_chunks += 1;
+                if received_chunks < piece_chunks {
+                    piece_buf.extend_from_slice(chunk);
+                    continue;
                 }
-            },
-            Err(e) => {
-                return Err(format!("error_receiving_extend_info:{}", e).to_string());
-            },
-        }
-
-        // send my initial extend_info
-        {
-            let packet = new_initial_extend_info_packet(&self.actual_peer.unwrap().ip);
-            self.send(packet);
-            self.recv();
-        }
-        // send interested
-        {
-            let packet = BitTorrentPacket{
-                id: CMD_INTERESTED,
-                length: 1,
-                data: None,
-            };
-            self.send(packet);
-            self.recv();
-        }
-
-        // some set up to start the pieces download
-        let mut last_piece = FullPiece{
-            piece_idx: 0,
-            data: Vec::with_capacity(self.torrent.piece_length - 0x60), // -0x60 -> signature in the last chunk is 0x60 bytes long
-        };
-        let mut last_piece_time = std::time::Instant::now();
-        let piece_chunks = self.torrent.piece_length / self.torrent.chunk_length;
-        let mut received_chunks = 0;
-        let mut requested_piece = false;
-        // update bittorrent client position if it is very old or -1 (not started)
-        {
-            let mut client_pos = self.actual_position_client.lock().unwrap();
-            let very_old_pos = (self.actual_position - *client_pos) > 60;
-            if *client_pos == -1 || very_old_pos {
-                *client_pos = self.actual_position;
-                self.request_piece(self.actual_position);
+                // Last chunk: strip the signature from the video payload.
+                let video_len = chunk
+                    .len()
+                    .checked_sub(SIGNATURE_LEN)
+                    .ok_or("error_video_download:short_last_chunk")?;
+                piece_buf.extend_from_slice(&chunk[..video_len]);
+                println!("[W] Received full piece ({piece_idx}) from {peer}");
+                gate.offer(piece_idx, piece_buf);
+                actual_position += 1;
+                requested_piece = false;
+                received_chunks = 0;
             }
-        }
 
-        loop{
-            match self.recv() {
-                Ok(packet) => {
-                    match packet.id {
-                        CMD_PIECE => {
-                            if let Some(packet_data) = packet.data {
-                                let piece = new_piece_from_bytes(packet_data.clone(), packet_data.len() - 18);
-                                if piece.chunk_idx != received_chunks {
-                                    continue;
-                                }
-                                received_chunks += 1;
-                                if received_chunks >= (piece_chunks as _) {
-                                    // last chunk, we must remove the signature from the video payload
-                                    println!("[W] Received full piece ({}) from {:?}", piece.piece_idx, self.actual_peer);
-                                    last_piece.data.extend_from_slice(&piece.data[..piece.data.len()-0x60]);
-                                    last_piece.piece_idx = piece.piece_idx;
-                                    self.send_chan.send(last_piece.clone());
-                                    self.actual_position += 1;
-                                    requested_piece = false;
-                                    received_chunks = 0;
-                                } else {
-                                    //println!("Received chunk {}/{} (piece:{}) from {:?} (chunklen={})", piece.chunk_idx, piece_chunks, piece.piece_idx, self.actual_peer, piece.data.len());
-                                    last_piece.data.extend_from_slice(&piece.data);
-                                    continue;
-                                }
-                            }
-                        },
-                        CMD_EXTEND_INFO_11 => {
-                        },
-                        _ => {
-                        },
-                    }
-
-                    let elapsed_since_last_piece = last_piece_time.elapsed().as_secs();
-                    if elapsed_since_last_piece > 3 {
-                        requested_piece = false;
-                        last_piece_time = std::time::Instant::now();
-                    }
-                    if !requested_piece {
-                        {
-                            let act_pos_client = self.actual_position_client.lock().unwrap();
-                            let old_piece = *act_pos_client == (self.actual_position-1);
-                            if *act_pos_client != -1 && !old_piece {
-                                self.actual_position = *act_pos_client;
-                            }
-                        }
-                        self.request_piece(self.actual_position);
-                        requested_piece = true;
-                        received_chunks = 0;
-                        last_piece.data.clear();
-                    }
-                },
-                Err(e) => {
-                    return Err(format!("error_video_download:{}", e.to_string()).to_string());
-                },
+            if last_piece_time.elapsed().as_secs() > PIECE_RETRY_SECS {
+                requested_piece = false;
+                last_piece_time = Instant::now();
             }
-        }
-    }
-
-    fn connect(&mut self, peer: dht::Peer) -> Result<usize, String> {
-        let conn = TcpStream::connect_timeout(&SocketAddr::from((peer.ip, peer.port)), 
-                    std::time::Duration::from_millis(2500));
-        match conn {
-            Ok(s) => {
-                s.set_read_timeout(Some(std::time::Duration::from_millis(5000)));
-                s.set_write_timeout(Some(std::time::Duration::from_millis(4500)));
-                self.socket = Some(s);
-                return Ok(1);
-            },
-            Err(e) => {
-                return Err(e.to_string());
-            },
-        }
-    }
-
-    fn recv(&self) -> Result<BitTorrentPacket, String> {
-        if let Some(mut socket) = self.socket.as_ref() {
-            let mut header = [0u8; 5]; // 4 bytes for length + 1 for message ID
-            match socket.read(&mut header[..4]) {
-                Ok(n) => {
-                    if n <= 0 {
-                        return Err("nothing_received".to_string());
-                    }
-                    let mut packet = packet_from_header(header.to_vec());
-                    if packet.length > 100000 || packet.length < 0 {
-                        return Err(format!("bad_packet_len:{}", packet.length).to_string());
-                    } else if packet.length == 0 {
-                        // ping packet
-                        return Ok(packet);
-                    }
-                    const BUF_SIZE: usize = 5000;
-                    let mut buff = [0u8; BUF_SIZE];
-                    let mut payload = Vec::with_capacity(packet.length as _);
-                    let mut read_bytes = 0usize;
-                    let mut diff = (packet.length as usize) - read_bytes;
-                    if diff > BUF_SIZE {
-                        diff = BUF_SIZE;
-                    }
-                    loop {
-                        if read_bytes >= (packet.length as _){
-                            break;
-                        }
-                        match socket.read(&mut buff[..diff]) {
-                            Ok(n) => {
-                                read_bytes += n;
-                                diff = (packet.length as usize) - read_bytes;
-                                if diff > BUF_SIZE {
-                                    diff = BUF_SIZE;
-                                }
-                                payload.extend_from_slice(&buff[0..n]);
-                                continue;
-                            },
-                            Err(e) => {
-                                return Err(e.to_string());
-                            },
-                        }
-                    }
-                    packet.id = payload[0];
-                    packet.data = Some(payload[1..].to_vec());
-                    return Ok(packet);
-                },
-                Err(e) => {
-                    return Err(e.to_string());
-                },
+            if !requested_piece {
+                // Follow the output position unless it points at the piece
+                // this worker has just completed.
+                let client_position = gate.position();
+                if client_position != -1 && client_position != actual_position - 1 {
+                    actual_position = client_position;
+                }
+                encode_piece_request(request_buf, actual_position, piece_chunks);
+                send(stream, request_buf)?;
+                requested_position = actual_position;
+                requested_piece = true;
+                received_chunks = 0;
+                piece_buf.clear();
             }
-        }
-        Err("error_recieving_packet".to_string())
-    }
-
-    fn send(&self, packet: BitTorrentPacket) -> Result<usize, String> {
-        if let Some(mut s) = self.socket.as_ref() {
-            let result = s.write(&packet.as_bytes());
-            match result {
-                Ok(n) => { return Ok(n) },
-                Err(e) => { return Err(e.to_string()) },
-            }
-        }
-        Err("no_tcpsocket".to_string())
-    }
-
-    fn send_handshake(&self) -> Result<usize, String>{
-        if let Some(mut s) = self.socket.as_ref() {
-            let mut payload: Vec<u8> = Vec::with_capacity(46);
-
-            payload.write_u8(0x11);
-            payload.write(b"AceStreamProtocol");
-            payload.write_i64::<BigEndian>(0);
-            payload.write(&hex::decode(self.torrent.infohash.clone()).unwrap());
-
-            let result = s.write(&payload);
-            match result {
-                Ok(n) => { return Ok(n) },
-                Err(e) => { return Err(e.to_string()) },
-            }
-        }
-        Err("no_tcpsocket".to_string())
-    }
-    fn recv_handshake(&self) -> Result<Vec<u8>, String>{
-        if let Some(mut s) = self.socket.as_ref() {
-            let mut payload = [0u8; 46];
-            let result = s.read(&mut payload);
-            match result {
-                Ok(n) => { return Ok(payload.to_vec()) },
-                Err(e) => { return Err(e.to_string()) },
-            }
-        }
-        Err("no_tcpsocket".to_string())
-    }
-
-    fn send_peer_id(&self) -> Result<usize, String>{
-        if let Some(mut s) = self.socket.as_ref() {
-            let payload = format!("R20------{}", generate_peer_id(11));
-
-            let result = s.write(payload.as_bytes());
-            match result {
-                Ok(n) => { return Ok(n) },
-                Err(e) => { return Err(e.to_string()) },
-            }
-        }
-        Err("no_tcpsocket".to_string())
-    }
-    fn recv_peer_id(&self) -> Result<Vec<u8>, String>{
-        if let Some(mut s) = self.socket.as_ref() {
-            let mut payload = [0u8; 20];
-            let result = s.read(&mut payload);
-            match result {
-                Ok(n) => { return Ok(payload.to_vec()) },
-                Err(e) => { return Err(e.to_string()) },
-            }
-        }
-        Err("no_tcpsocket".to_string())
-    }
-
-    fn request_piece_chunk(&self, piece: i64, chunk: i16) -> Result<usize, String>{
-        let mut payload: Vec<u8> = Vec::with_capacity(10);
-        payload.write_i64::<BigEndian>(piece);
-        payload.write_i16::<BigEndian>(chunk);
-        let mut packet = BitTorrentPacket{
-            length: 11,
-            id: CMD_REQUEST as _,
-            data: Some(payload),
-        };
-        self.send(packet)
-    }
-    fn request_piece(&self, piece: i64) {
-        let piece_chunks = self.torrent.piece_length / self.torrent.chunk_length;
-        for i in 0..piece_chunks {
-            self.request_piece_chunk(piece, i as _);
         }
     }
 }
 
-fn generate_peer_id(size: usize) -> String {
-    let alphabet = Slice::new(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789").unwrap();
-    let rng = rand::thread_rng();
-    let peer_id: Vec<u8> = rng.sample_iter(&alphabet).take(size).map(|b| { *b }).collect();
-    String::from_utf8(peer_id).unwrap()
+fn send(stream: &TcpStream, data: &[u8]) -> Result<(), String> {
+    (&mut &*stream).write_all(data).map_err(|e| e.to_string())
 }
 
-// BitTorrent BENCODE messages
-#[derive(Debug, Serialize, Deserialize)]
-struct InitialExtendInfo {
-    pv: i64,
-    tt: String,
-    mi: InitialExtendInfoMI,
-    ts: i64,
-    p: i64,
-    lsp: i64,
-    v: i64,
-    nt: i64,
-    opts: Option<i64>,
-    yourip: ByteBuf,
-}
-#[derive(Debug, Serialize, Deserialize)]
-struct InitialExtendInfoMI {
-    down_rate: i64,
-    min_piece: i64,
-    live_window_size: i64,
-    is_accessible: i32,
-    top_up_rate: i64,
-    top_session_up_rate: i64,
-    max_piece: i64,
-    position: i64,
-    up_rate: i64,
-    upload_rating: i64,
+/// Buffered reader that parses packets in place.
+struct Connection<'a> {
+    stream: &'a TcpStream,
+    buf: &'a mut Vec<u8>,
+    start: usize,
+    end: usize,
 }
 
-impl InitialExtendInfo {
-    pub fn to_bencode(&self) -> Result<Vec<u8>, String> {
-        let encoded = to_bytes(self);
-        if let Err(e) = encoded {
-            return Err(format!("error_bencoding:{}", e).to_string())
+impl Connection<'_> {
+    /// Ensures at least `n` bytes are buffered.
+    fn fill(&mut self, n: usize) -> Result<(), String> {
+        while self.end - self.start < n {
+            if self.start == self.end {
+                self.start = 0;
+                self.end = 0;
+            } else if self.start > 0
+                && (self.buf.len() - self.start < n || self.buf.len() - self.end < MIN_READ_SPACE)
+            {
+                self.buf.copy_within(self.start..self.end, 0);
+                self.end -= self.start;
+                self.start = 0;
+            }
+            if self.buf.len() - self.start < n {
+                self.buf.resize(self.start + n, 0);
+            }
+            match (&mut &*self.stream).read(&mut self.buf[self.end..]) {
+                Ok(0) => return Err("nothing_received".into()),
+                Ok(read) => self.end += read,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.to_string()),
+            }
         }
-        return Ok(encoded.unwrap());
+        Ok(())
+    }
+
+    fn read_exact(&mut self, n: usize) -> Result<&[u8], String> {
+        self.fill(n)?;
+        let start = self.start;
+        self.start += n;
+        Ok(&self.buf[start..start + n])
+    }
+
+    /// Returns the next packet as `(message id, payload)`. Keep-alive
+    /// packets are reported with id 0 and an empty payload.
+    fn next_packet(&mut self) -> Result<(u8, &[u8]), String> {
+        self.fill(4)?;
+        let s = self.start;
+        let len = i32::from_be_bytes([
+            self.buf[s],
+            self.buf[s + 1],
+            self.buf[s + 2],
+            self.buf[s + 3],
+        ]);
+        if !(0..=MAX_PACKET_LEN).contains(&len) {
+            return Err(format!("bad_packet_len:{len}"));
+        }
+        if len == 0 {
+            self.start += 4;
+            return Ok((0, &[]));
+        }
+        let packet = self.read_exact(4 + len as usize)?;
+        Ok((packet[4], &packet[5..]))
     }
 }
 
-fn new_initial_extend_info_packet(peer_addr: &[u8]) -> BitTorrentPacket {
-    let mut version_code: i64 = 3013200;
-    if let Ok(v_code) = api::VERSION_CODE.parse() {
-        version_code = v_code;
+/// Serialises the REQUEST messages for every chunk of `piece` so they can be
+/// sent with a single write.
+fn encode_piece_request(buf: &mut Vec<u8>, piece: i64, chunks: usize) {
+    buf.clear();
+    for chunk in 0..chunks {
+        buf.extend_from_slice(&11u32.to_be_bytes());
+        buf.push(CMD_REQUEST);
+        buf.extend_from_slice(&piece.to_be_bytes());
+        buf.extend_from_slice(&(chunk as i16).to_be_bytes());
     }
+}
 
-    let payload = InitialExtendInfo{
-        pv: 2,
-        tt: "bt".to_string(),
-        mi: InitialExtendInfoMI{
-            down_rate: 80000,
-            min_piece: -1,
-            live_window_size: 987,
-            is_accessible: 0,
-            top_up_rate: 0,
-            top_session_up_rate: 0,
-            max_piece: -1,
-            position: -1,
-            up_rate: 0,
-            upload_rating: 0,
-        },
-        ts: 413,
-        p: BITTORRENT_PORT as _,
-        lsp: 284912,
-        v: version_code,
-        nt: 1,
-        opts: Some(15),
-        yourip: ByteBuf::from(peer_addr.to_vec()),
-    };
-
-    let mut final_payload = vec![0]; // extend_info type is one byte !!
-    final_payload.extend_from_slice(&payload.to_bencode().unwrap());
-
-    BitTorrentPacket{
-        id: CMD_EXTEND_INFO,
-        length: 0,
-        data: Some(final_payload),
+fn generate_peer_id(rng: &mut Rng) -> [u8; PEER_ID_LEN] {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut id = *b"R20------00000000000";
+    for b in &mut id[9..] {
+        *b = ALPHABET[rng.below(ALPHABET.len())];
     }
+    id
+}
+
+/// Extracts `mi.max_piece` from the peer's EXTEND_INFO payload.
+fn parse_max_piece(payload: &[u8]) -> Result<i64, String> {
+    // The first payload byte is the extended message type.
+    let body = payload
+        .get(1..)
+        .ok_or("error_bdecoding_extend_info:empty_payload")?;
+    let info = bencode::decode(body).map_err(|e| format!("error_bdecoding_extend_info:{e}"))?;
+    info.get(b"mi")
+        .and_then(|mi| mi.get(b"max_piece"))
+        .and_then(|v| v.as_int())
+        .ok_or_else(|| "error_bdecoding_extend_info:missing field `max_piece`".into())
+}
+
+/// Builds our initial EXTEND_INFO packet (bencoded dictionary with sorted
+/// keys, preceded by the extended message type 0).
+fn extend_info_packet(peer_ip: [u8; 4]) -> Vec<u8> {
+    let version_code: i64 = api::VERSION_CODE.parse().unwrap_or(3013200);
+    let mut p = Vec::with_capacity(300);
+    p.extend_from_slice(&[0, 0, 0, 0, CMD_EXTEND_INFO, 0]); // length is patched below
+    p.push(b'd');
+    bencode::put_key_int(&mut p, "lsp", 284912);
+    bencode::put_bytes(&mut p, b"mi");
+    p.push(b'd');
+    bencode::put_key_int(&mut p, "down_rate", 80000);
+    bencode::put_key_int(&mut p, "is_accessible", 0);
+    bencode::put_key_int(&mut p, "live_window_size", 987);
+    bencode::put_key_int(&mut p, "max_piece", -1);
+    bencode::put_key_int(&mut p, "min_piece", -1);
+    bencode::put_key_int(&mut p, "position", -1);
+    bencode::put_key_int(&mut p, "top_session_up_rate", 0);
+    bencode::put_key_int(&mut p, "top_up_rate", 0);
+    bencode::put_key_int(&mut p, "up_rate", 0);
+    bencode::put_key_int(&mut p, "upload_rating", 0);
+    p.push(b'e');
+    bencode::put_key_int(&mut p, "nt", 1);
+    bencode::put_key_int(&mut p, "opts", 15);
+    bencode::put_key_int(&mut p, "p", BITTORRENT_PORT as i64);
+    bencode::put_key_int(&mut p, "pv", 2);
+    bencode::put_key_int(&mut p, "ts", 413);
+    bencode::put_bytes(&mut p, b"tt");
+    bencode::put_bytes(&mut p, b"bt");
+    bencode::put_key_int(&mut p, "v", version_code);
+    bencode::put_bytes(&mut p, b"yourip");
+    bencode::put_bytes(&mut p, &peer_ip);
+    p.push(b'e');
+    let len = (p.len() - 4) as u32;
+    p[..4].copy_from_slice(&len.to_be_bytes());
+    p
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn bdecode_extend_info_works() {
-        const INPUT: [u8; 519] = [100,50,48,58,97,99,101,95,109,101,116,97,100,97,116,97,95,118,101,114,115,105,111,110,105,49,101,49,51,58,103,101,111,105,112,95,99,111,117,110,116,114,121,50,58,69,83,51,58,108,115,112,105,49,49,53,51,50,56,101,49,58,109,100,49,49,58,117,116,95,109,101,116,97,100,97,116,97,105,50,101,101,50,58,109,105,100,50,48,58,100,105,115,116,97,110,99,101,95,102,114,111,109,95,115,111,117,114,99,101,105,48,101,57,58,100,111,119,110,95,114,97,116,101,105,53,57,50,49,55,49,101,49,57,58,100,111,119,110,108,111,97,100,95,119,105,110,100,111,119,95,101,110,100,105,49,49,53,51,50,56,101,49,51,58,105,115,95,97,99,99,101,115,115,105,98,108,101,105,49,101,49,54,58,108,105,118,101,95,119,105,110,100,111,119,95,115,105,122,101,105,49,49,48,101,51,58,108,115,112,105,49,49,53,51,50,56,101,51,58,109,97,109,105,45,49,101,57,58,109,97,120,95,112,105,101,99,101,105,49,49,53,51,50,55,101,57,58,109,105,110,95,112,105,101,99,101,105,49,49,52,55,51,50,101,57,58,112,101,101,114,95,116,121,112,101,105,48,101,49,54,58,112,105,110,103,95,102,114,111,109,95,115,111,117,114,99,101,105,48,101,56,58,112,111,115,105,116,105,111,110,105,49,49,53,51,49,54,101,49,54,58,116,105,109,101,95,102,114,111,109,95,115,111,117,114,99,101,105,45,49,101,49,57,58,116,111,112,95,115,101,115,115,105,111,110,95,117,112,95,114,97,116,101,105,50,50,54,53,57,48,53,101,49,49,58,116,111,112,95,117,112,95,114,97,116,101,105,50,50,51,55,55,51,54,101,55,58,117,112,95,114,97,116,101,105,52,53,49,55,53,101,49,51,58,117,112,108,111,97,100,95,114,97,116,105,110,103,105,48,101,101,50,58,110,116,105,49,101,49,58,112,105,56,54,50,49,101,56,58,112,108,97,116,102,111,114,109,105,51,101,50,58,112,118,105,50,101,50,58,116,115,105,49,54,51,50,57,49,55,49,52,55,101,50,58,116,116,50,58,98,116,49,58,118,105,51,48,49,54,55,48,49,101,54,58,121,111,117,114,105,112,52,58,87,219,33,178,101];
-        let resp = serde_bencode::de::from_bytes::<crate::acestream::bittorrent::InitialExtendInfo>(&INPUT).unwrap();
-        println!("Extend info: {:?}", resp);
+    use super::*;
+    use std::net::TcpListener;
 
-        let ok = resp.tt.eq("bt") && (resp.p == 8621);
-        assert_eq!(ok, true);
+    #[test]
+    fn extend_info_matches_original_encoding() {
+        // Packet produced by the original serde_bencode based implementation.
+        let expected: &[u8] = &[
+            0, 0, 1, 21, 20, 0, 100, 51, 58, 108, 115, 112, 105, 50, 56, 52, 57, 49, 50, 101, 50,
+            58, 109, 105, 100, 57, 58, 100, 111, 119, 110, 95, 114, 97, 116, 101, 105, 56, 48, 48,
+            48, 48, 101, 49, 51, 58, 105, 115, 95, 97, 99, 99, 101, 115, 115, 105, 98, 108, 101,
+            105, 48, 101, 49, 54, 58, 108, 105, 118, 101, 95, 119, 105, 110, 100, 111, 119, 95,
+            115, 105, 122, 101, 105, 57, 56, 55, 101, 57, 58, 109, 97, 120, 95, 112, 105, 101, 99,
+            101, 105, 45, 49, 101, 57, 58, 109, 105, 110, 95, 112, 105, 101, 99, 101, 105, 45, 49,
+            101, 56, 58, 112, 111, 115, 105, 116, 105, 111, 110, 105, 45, 49, 101, 49, 57, 58, 116,
+            111, 112, 95, 115, 101, 115, 115, 105, 111, 110, 95, 117, 112, 95, 114, 97, 116, 101,
+            105, 48, 101, 49, 49, 58, 116, 111, 112, 95, 117, 112, 95, 114, 97, 116, 101, 105, 48,
+            101, 55, 58, 117, 112, 95, 114, 97, 116, 101, 105, 48, 101, 49, 51, 58, 117, 112, 108,
+            111, 97, 100, 95, 114, 97, 116, 105, 110, 103, 105, 48, 101, 101, 50, 58, 110, 116,
+            105, 49, 101, 52, 58, 111, 112, 116, 115, 105, 49, 53, 101, 49, 58, 112, 105, 56, 54,
+            50, 49, 101, 50, 58, 112, 118, 105, 50, 101, 50, 58, 116, 115, 105, 52, 49, 51, 101,
+            50, 58, 116, 116, 50, 58, 98, 116, 49, 58, 118, 105, 51, 48, 49, 51, 50, 48, 48, 101,
+            54, 58, 121, 111, 117, 114, 105, 112, 52, 58, 87, 219, 33, 178, 101,
+        ];
+        assert_eq!(extend_info_packet([87, 219, 33, 178]), expected);
+    }
+
+    #[test]
+    fn parses_peer_extend_info() {
+        const INPUT: [u8; 519] = [
+            100, 50, 48, 58, 97, 99, 101, 95, 109, 101, 116, 97, 100, 97, 116, 97, 95, 118, 101,
+            114, 115, 105, 111, 110, 105, 49, 101, 49, 51, 58, 103, 101, 111, 105, 112, 95, 99,
+            111, 117, 110, 116, 114, 121, 50, 58, 69, 83, 51, 58, 108, 115, 112, 105, 49, 49, 53,
+            51, 50, 56, 101, 49, 58, 109, 100, 49, 49, 58, 117, 116, 95, 109, 101, 116, 97, 100,
+            97, 116, 97, 105, 50, 101, 101, 50, 58, 109, 105, 100, 50, 48, 58, 100, 105, 115, 116,
+            97, 110, 99, 101, 95, 102, 114, 111, 109, 95, 115, 111, 117, 114, 99, 101, 105, 48,
+            101, 57, 58, 100, 111, 119, 110, 95, 114, 97, 116, 101, 105, 53, 57, 50, 49, 55, 49,
+            101, 49, 57, 58, 100, 111, 119, 110, 108, 111, 97, 100, 95, 119, 105, 110, 100, 111,
+            119, 95, 101, 110, 100, 105, 49, 49, 53, 51, 50, 56, 101, 49, 51, 58, 105, 115, 95, 97,
+            99, 99, 101, 115, 115, 105, 98, 108, 101, 105, 49, 101, 49, 54, 58, 108, 105, 118, 101,
+            95, 119, 105, 110, 100, 111, 119, 95, 115, 105, 122, 101, 105, 49, 49, 48, 101, 51, 58,
+            108, 115, 112, 105, 49, 49, 53, 51, 50, 56, 101, 51, 58, 109, 97, 109, 105, 45, 49,
+            101, 57, 58, 109, 97, 120, 95, 112, 105, 101, 99, 101, 105, 49, 49, 53, 51, 50, 55,
+            101, 57, 58, 109, 105, 110, 95, 112, 105, 101, 99, 101, 105, 49, 49, 52, 55, 51, 50,
+            101, 57, 58, 112, 101, 101, 114, 95, 116, 121, 112, 101, 105, 48, 101, 49, 54, 58, 112,
+            105, 110, 103, 95, 102, 114, 111, 109, 95, 115, 111, 117, 114, 99, 101, 105, 48, 101,
+            56, 58, 112, 111, 115, 105, 116, 105, 111, 110, 105, 49, 49, 53, 51, 49, 54, 101, 49,
+            54, 58, 116, 105, 109, 101, 95, 102, 114, 111, 109, 95, 115, 111, 117, 114, 99, 101,
+            105, 45, 49, 101, 49, 57, 58, 116, 111, 112, 95, 115, 101, 115, 115, 105, 111, 110, 95,
+            117, 112, 95, 114, 97, 116, 101, 105, 50, 50, 54, 53, 57, 48, 53, 101, 49, 49, 58, 116,
+            111, 112, 95, 117, 112, 95, 114, 97, 116, 101, 105, 50, 50, 51, 55, 55, 51, 54, 101,
+            55, 58, 117, 112, 95, 114, 97, 116, 101, 105, 52, 53, 49, 55, 53, 101, 49, 51, 58, 117,
+            112, 108, 111, 97, 100, 95, 114, 97, 116, 105, 110, 103, 105, 48, 101, 101, 50, 58,
+            110, 116, 105, 49, 101, 49, 58, 112, 105, 56, 54, 50, 49, 101, 56, 58, 112, 108, 97,
+            116, 102, 111, 114, 109, 105, 51, 101, 50, 58, 112, 118, 105, 50, 101, 50, 58, 116,
+            115, 105, 49, 54, 51, 50, 57, 49, 55, 49, 52, 55, 101, 50, 58, 116, 116, 50, 58, 98,
+            116, 49, 58, 118, 105, 51, 48, 49, 54, 55, 48, 49, 101, 54, 58, 121, 111, 117, 114,
+            105, 112, 52, 58, 87, 219, 33, 178, 101,
+        ];
+        let mut payload = vec![0u8];
+        payload.extend_from_slice(&INPUT);
+        assert_eq!(parse_max_piece(&payload), Ok(115327));
+        assert!(parse_max_piece(&[]).is_err());
+        assert!(parse_max_piece(&[0, b'd', b'e']).is_err());
+    }
+
+    #[test]
+    fn piece_request_layout() {
+        let mut buf = Vec::new();
+        encode_piece_request(&mut buf, 275228605, 32);
+        assert_eq!(buf.len(), 32 * REQUEST_LEN);
+        assert_eq!(
+            &buf[..15],
+            &[0, 0, 0, 11, 6, 0, 0, 0, 0, 16, 103, 167, 189, 0, 0]
+        );
+        assert_eq!(&buf[buf.len() - 2..], &[0, 31]);
+    }
+
+    #[test]
+    fn peer_id_format() {
+        let id = generate_peer_id(&mut Rng::new());
+        assert!(id.starts_with(b"R20------"));
+        assert!(id[9..].iter().all(u8::is_ascii_alphanumeric));
+    }
+
+    /// Feeds packets split at awkward boundaries through a real socket.
+    #[test]
+    fn connection_reassembles_fragmented_packets() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut data = Vec::new();
+            data.extend_from_slice(b"HELLO");
+            data.extend_from_slice(&[0, 0, 0, 0]); // keep-alive
+            for i in 0..50u32 {
+                let len = 1 + 1000 * (i as usize % 7);
+                data.extend_from_slice(&(len as u32).to_be_bytes());
+                data.push(i as u8);
+                data.extend(std::iter::repeat_n(i as u8, len - 1));
+            }
+            for piece in data.chunks(777) {
+                s.write_all(piece).unwrap();
+                s.flush().unwrap();
+            }
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut buf = vec![0; 4096]; // small on purpose: forces compaction and growth
+        let mut conn = Connection {
+            stream: &stream,
+            buf: &mut buf,
+            start: 0,
+            end: 0,
+        };
+        assert_eq!(conn.read_exact(5).unwrap(), b"HELLO");
+        assert_eq!(conn.next_packet().unwrap(), (0, &[][..]));
+        for i in 0..50u32 {
+            let (id, payload) = conn.next_packet().unwrap();
+            assert_eq!(id, i as u8);
+            assert_eq!(payload.len(), 1000 * (i as usize % 7));
+            assert!(payload.iter().all(|&b| b == i as u8));
+        }
+        writer.join().unwrap();
+        assert_eq!(conn.next_packet().unwrap_err(), "nothing_received");
+    }
+
+    #[test]
+    fn rejects_bad_packet_lengths() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.write_all(&(-1i32).to_be_bytes()).unwrap();
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut buf = vec![0; 64];
+        let mut conn = Connection {
+            stream: &stream,
+            buf: &mut buf,
+            start: 0,
+            end: 0,
+        };
+        assert_eq!(conn.next_packet().unwrap_err(), "bad_packet_len:-1");
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn gate_forwards_in_order() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pool = Arc::new(BufferPool {
+            free: Mutex::new(Vec::new()),
+            buf_capacity: 16,
+        });
+        let gate = Gate {
+            position: AtomicI64::new(-1),
+            out: Mutex::new(Some(tx)),
+            pool: pool.clone(),
+        };
+
+        let mut buf = vec![1, 2, 3];
+        gate.offer(10, &mut buf); // first piece is always accepted
+        assert!(buf.is_empty());
+        let mut stale = vec![9];
+        gate.offer(10, &mut stale); // duplicate: rejected, buffer untouched
+        assert_eq!(stale, [9]);
+        let mut next = vec![4];
+        gate.offer(11, &mut next);
+        assert_eq!(gate.position(), 12);
+
+        let received: Vec<(i32, Vec<u8>)> = rx
+            .try_iter()
+            .map(|p| (p.piece_idx, p.data.to_vec()))
+            .collect();
+        assert_eq!(received, [(10, vec![1, 2, 3]), (11, vec![4])]);
+        // Dropped pieces returned their buffers to the pool.
+        assert_eq!(lock(&pool.free).len(), 2);
+
+        assert!(!gate.sync_start(40)); // close enough: keep the position
+        assert!(gate.sync_start(100)); // too far ahead: jump
+        assert_eq!(gate.position(), 100);
     }
 }

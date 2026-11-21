@@ -1,97 +1,138 @@
+use acelib::acestream::{bittorrent, utils};
+use acelib::server;
 
-mod crypto;
-mod acestream;
-mod utils;
-mod bittorrent;
-mod server;
+const VERSION: &str = "0.1";
+const HELP: &str = "acestream-rs 0.1
 
-use clap::{App, Arg};
+USAGE:
+    acestream-rs [FLAGS] [OPTIONS]
+
+FLAGS:
+    -h, --help       Prints help information
+        --http       HTTP as output server
+    -V, --version    Prints version information
+
+OPTIONS:
+        --dport <dport>    DHT UDP port
+    -p <playerid>          Player ID/Content ID
+    -P <port>              Output server port
+    -t <torrent>           Torrent file
+    -w <workers>           Number of workers (threads) to download video";
+
+struct Options {
+    torrent: String,
+    player_id: String,
+    workers: usize,
+    port: u16,
+    use_http: bool,
+    dht_port: Option<u16>,
+}
+
+enum Command {
+    Run(Options),
+    Help,
+    Version,
+}
+
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
+    let mut torrent = String::new();
+    let mut player_id = String::new();
+    let mut workers = None;
+    let mut port = None;
+    let mut use_http = false;
+    let mut dht_port = None;
+
+    while let Some(arg) = args.next() {
+        // Accepts "-x value", "-xvalue", "-x=value", "--long value" and "--long=value".
+        let (name, inline) = match arg.strip_prefix("--") {
+            Some(long) => match long.split_once('=') {
+                Some((n, v)) => (format!("--{n}"), Some(v.to_owned())),
+                None => (arg.clone(), None),
+            },
+            None if arg.len() > 2 && arg.starts_with('-') && arg.is_char_boundary(2) => {
+                let v = &arg[2..];
+                (
+                    arg[..2].to_owned(),
+                    Some(v.strip_prefix('=').unwrap_or(v).to_owned()),
+                )
+            }
+            None => (arg.clone(), None),
+        };
+        let mut value = |label: &str| -> Result<String, String> {
+            inline.clone().or_else(|| args.next()).ok_or_else(|| {
+                format!("The argument '{label}' requires a value but none was supplied")
+            })
+        };
+        match name.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "-V" | "--version" => return Ok(Command::Version),
+            "--http" if inline.is_none() => use_http = true,
+            "-t" => torrent = value("-t <torrent>")?,
+            "-p" => player_id = value("-p <playerid>")?,
+            "-w" => workers = Some(parse_number(&value("-w <workers>")?, "workers")?),
+            "-P" => port = Some(parse_number(&value("-P <port>")?, "port")?),
+            "--dport" => dht_port = Some(parse_number(&value("--dport <dport>")?, "dport")?),
+            _ => return Err(format!("Found argument '{arg}' which wasn't expected")),
+        }
+    }
+
+    Ok(Command::Run(Options {
+        torrent,
+        player_id,
+        workers: workers.unwrap_or(6),
+        port: port.unwrap_or(4000),
+        use_http,
+        dht_port,
+    }))
+}
+
+fn parse_number<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, String> {
+    value
+        .parse()
+        .map_err(|_| format!("Invalid value '{value}' for <{name}>"))
+}
+
+fn fail(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1);
+}
 
 fn main() {
-    let args = clap::App::new("acestream-rs")
-                .version("0.1")
-                .arg(clap::Arg::with_name("torrent")
-                    .short("t")
-                    .help("Torrent file")
-                    .required(false)
-                    .takes_value(true))
-                .arg(clap::Arg::with_name("playerid")
-                    .short("p")
-                    .help("Player ID/Content ID")
-                    .required(false)
-                    .takes_value(true))
-                .arg(clap::Arg::with_name("workers")
-                    .short("w")
-                    .help("Number of workers (threads) to download video")
-                    .required(false)
-                    .takes_value(true))
-                .arg(clap::Arg::with_name("port")
-                    .short("P")
-                    .help("Output server port")
-                    .required(false)
-                    .takes_value(true))
-                .arg(clap::Arg::with_name("http")
-                    .long("http")
-                    .help("HTTP as output server")
-                    .required(false)
-                    .takes_value(false))
-                .arg(clap::Arg::with_name("dport")
-                    .long("dport")
-                    .help("DHT UDP port")
-                    .required(false)
-                    .takes_value(true))
-                .get_matches();
-    
-    let torrent_file = args.value_of("torrent").unwrap_or("");
-    let player_id = args.value_of("playerid").unwrap_or("");
-    let workers: usize = args.value_of("workers").unwrap_or("6").parse().unwrap();
-    let port: u16 = args.value_of("port").unwrap_or("4000").parse().unwrap();
-    let use_http: bool = args.is_present("http");
-    let mut dport: Option<u16> = None;
-    if args.is_present("dport") {
-        dport = Some(args.value_of("dport").unwrap_or("").parse().unwrap());
-    }
+    let opts = match parse_args(std::env::args().skip(1)) {
+        Ok(Command::Run(opts)) => opts,
+        Ok(Command::Help) => {
+            println!("{HELP}");
+            return;
+        }
+        Ok(Command::Version) => {
+            println!("acestream-rs {VERSION}");
+            return;
+        }
+        Err(e) => fail(&format!("error: {e}\n\n{HELP}")),
+    };
 
-    let mut torrent: Option<acestream::torrent::Torrent> = None;
-    if player_id.len() > 0 {
-        match acestream::utils::torrent_from_player_id(player_id.to_string()) {
-            Ok(t) => {
-                torrent = Some(t);
-            },
-            Err(e) => {
-                panic!(e)
-            }
-        }
-    } else if torrent_file.len() > 0 {
-        match acestream::utils::torrent_from_encrypted_torrentfile(torrent_file.to_string()) {
-            Ok(t) => {
-                torrent = Some(t);
-            },
-            Err(e) => {
-                panic!(e)
-            }
-        }
+    let torrent = if !opts.player_id.is_empty() {
+        utils::torrent_from_player_id(&opts.player_id)
+    } else if !opts.torrent.is_empty() {
+        utils::torrent_from_encrypted_torrentfile(&opts.torrent)
     } else {
-        panic!("ERROR: Provide torrent or player ID!");
-    }
+        fail("ERROR: Provide torrent or player ID!");
+    };
+    let torrent = torrent.unwrap_or_else(|e| fail(&format!("ERROR: {e}")));
 
-    let mut tx: std::sync::mpsc::Sender<acestream::bittorrent::FullPiece>;
-    if use_http {
+    let tx = if opts.use_http {
         // TODO: not working (only VLC..)
         let mut out_server = server::http::OutHttpServer::new();
-        out_server.run_forever(port);
-        tx = out_server.get_tx();
+        out_server.run_forever(opts.port);
+        out_server.get_tx()
     } else {
         // start raw TCP server to serve video pieces
         let mut out_server = server::tcp::OutTcpServer::new();
-        out_server.run_forever(port);
-        tx = out_server.get_tx();
-    }
+        out_server.run_forever(opts.port);
+        out_server.get_tx()
+    };
 
-    // everything OK
-    if let Some(t) = torrent {
-        println!("{:?}", t);
-        let mut bt_client = acestream::bittorrent::new_client(t, Some(tx));
-        bt_client.start(workers, dport);
-    }
+    println!("{torrent:?}");
+    let mut bt_client = bittorrent::new_client(torrent, Some(tx));
+    bt_client.start(opts.workers, opts.dht_port);
 }

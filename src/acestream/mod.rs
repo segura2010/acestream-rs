@@ -1,5 +1,5 @@
-pub mod utils;
-pub mod torrent;
 pub mod api;
 pub mod bittorrent;
-mod crypto;
+pub(crate) mod crypto;
+pub mod torrent;
+pub mod utils;

@@ -1,90 +1,28 @@
+use std::sync::mpsc::Sender;
 
-use crate::acestream::bittorrent;
+use super::output::{self, Mode};
+use crate::acestream::bittorrent::FullPiece;
 
-use std::net::TcpStream;
-use std::io::{Write, Read};
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc;
-use std::sync::mpsc::{Sender, Receiver};
-
+/// Minimal HTTP output server: answers every client with an endless
+/// `video/mpeg` response. Serves one client at a time.
+#[derive(Default)]
 pub struct OutHttpServer {
-    pub tx: Option<Sender<bittorrent::FullPiece>>,
+    tx: Option<Sender<FullPiece>>,
 }
-
 
 impl OutHttpServer {
     pub fn new() -> Self {
-        Self{
-            tx: None,
-        }
+        Self::default()
     }
 
-    pub fn get_tx(&self) -> Sender<bittorrent::FullPiece> {
-        self.tx.as_ref().unwrap().clone()
+    /// Returns the channel that feeds the server. Panics if the server is not
+    /// running.
+    pub fn get_tx(&self) -> Sender<FullPiece> {
+        self.tx.clone().expect("OutHttpServer is not running")
     }
 
+    /// Starts the server threads (non-blocking).
     pub fn run_forever(&mut self, port: u16) {
-        let (tx_bit, rx_bit) = mpsc::channel();
-        self.tx = Some(tx_bit);
-        
-        let (tx_client, rx_client) = mpsc::channel();
-        
-        let client_connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-
-        // just a consumer for when no client is connected
-        let shared_client_tx = tx_client.clone();
-        let shared_client_connected = client_connected.clone();
-        std::thread::spawn(move||{
-            loop{
-                if let Ok(piece) = rx_bit.recv() {
-                    if *(shared_client_connected.lock().unwrap()) {
-                        shared_client_tx.send(piece);
-                    }
-                }
-            }
-        });
-
-        let shared_client_connected = client_connected.clone();
-        std::thread::spawn(move||{
-            if let Ok(tcp_listener) = std::net::TcpListener::bind(format!("0.0.0.0:{}", port)){
-                println!("[S] OutHttpServer listening on port {}..", port);
-                for tcp_stream in tcp_listener.incoming() {
-                    if let Ok(mut tstream) = tcp_stream {
-                        println!("[S] New client connected from {}", tstream.peer_addr().unwrap());
-                        tstream.set_write_timeout(
-                            Some(std::time::Duration::from_millis(2000))
-                        );
-                        tstream.set_read_timeout(
-                            Some(std::time::Duration::from_millis(1500))
-                        );
-                        tstream.set_nodelay(true);
-                        // send HTTP headers
-                        tstream.write(b"HTTP/1.1 200 OK\r\n");
-                        tstream.write(b"Content-Type: video/mpeg\r\n");
-                        tstream.write(b"Accept-Ranges: bytes\r\n");
-                        //tstream.write(b"Transfer-Encoding: chunked\r\n");
-                        tstream.write(b"\r\n");
-
-                        *(shared_client_connected.lock().unwrap()) = true;
-                        loop{
-                            match rx_client.recv() {
-                                Ok(piece) => {
-                                    if let Err(e) = tstream.write(&piece.data) {
-                                        println!("[S] Error sending to client: {}", e);
-                                        break;
-                                    }
-                                },
-                                Err(e) => {
-                                    println!("[S] Error receiving piece: {}", e);
-                                },
-                            }
-                        }
-                        *(shared_client_connected.lock().unwrap()) = false;
-                    }
-                }
-            } else {
-                println!("[S] ERROR: unable to create TcpListener");
-            }
-        });
+        self.tx = Some(output::spawn(port, Mode::Http));
     }
 }

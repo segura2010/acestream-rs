@@ -1,48 +1,45 @@
-#[macro_use]
-extern crate lazy_static;
+//! Download-only client for the AceStream P2P protocol.
 
+pub mod acestream;
+pub mod bittorrent;
+pub mod server;
+
+mod bencode;
 mod crypto;
-mod acestream;
 mod utils;
-mod bittorrent;
-mod server;
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-lazy_static! {
-    pub static ref already_playing: Mutex<bool> = Mutex::new(false);
-}
+static ALREADY_PLAYING: AtomicBool = AtomicBool::new(false);
 
+/// Fetches the content, serves it on a raw TCP server at `port` and blocks
+/// forever downloading it. Only one content can be played per process.
 pub fn play_acestream_with_playerid(player_id: String, port: u16, workers: usize) {
-    if *already_playing.lock().unwrap() {
-        panic!("Already playing content!");
+    if player_id.is_empty() {
+        eprintln!("ERROR: Provide torrent or player ID!");
+        return;
+    }
+    if ALREADY_PLAYING.swap(true, Ordering::SeqCst) {
+        eprintln!("Already playing content!");
+        return;
     }
 
-    let mut torrent: Option<acestream::torrent::Torrent> = None;
-    if player_id.len() > 0 {
-        match acestream::utils::torrent_from_player_id(player_id.to_string()) {
-            Ok(t) => {
-                torrent = Some(t);
-            },
-            Err(e) => {
-                panic!(e)
-            }
+    let torrent = match acestream::utils::torrent_from_player_id(&player_id) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            ALREADY_PLAYING.store(false, Ordering::SeqCst);
+            return;
         }
-    } else {
-        panic!("ERROR: Provide torrent or player ID!");
-    }
+    };
 
     // start raw TCP server to serve video pieces
     let mut out_server = server::tcp::OutTcpServer::new();
     out_server.run_forever(port);
-    let tx = out_server.get_tx();
 
-    if let Some(t) = torrent {
-        *already_playing.lock().unwrap() = true;
-        println!("{:?}", t);
-        let mut bt_client = acestream::bittorrent::new_client(t, Some(tx));
-        bt_client.start(workers, None);
-    }
+    println!("{torrent:?}");
+    let mut bt_client = acestream::bittorrent::new_client(torrent, Some(out_server.get_tx()));
+    bt_client.start(workers, None);
 }
 
 // compile with: cargo ndk -t armeabi-v7a -t arm64-v8a -o ./target/jniLibs build --lib --release
@@ -51,11 +48,22 @@ pub fn play_acestream_with_playerid(player_id: String, port: u16, workers: usize
 mod android {
     use jni::JNIEnv;
     use jni::objects::{JClass, JString};
-    use jni::sys::{jstring};
-    #[no_mangle]
-    pub fn Java_org_videolan_vlc_gui_network_MRLPanelFragment_playacestream(env: JNIEnv, _: JClass, player_id: JString) {
-        let p_id: String = env.get_string(player_id).expect("invalid pattern string").into();
-        std::thread::spawn(move|| {
+
+    #[unsafe(no_mangle)]
+    #[allow(non_snake_case)]
+    pub extern "system" fn Java_org_videolan_vlc_gui_network_MRLPanelFragment_playacestream(
+        env: JNIEnv,
+        _: JClass,
+        player_id: JString,
+    ) {
+        let p_id: String = match env.get_string(player_id) {
+            Ok(s) => s.into(),
+            Err(_) => {
+                eprintln!("ERROR: invalid player id string");
+                return;
+            }
+        };
+        std::thread::spawn(move || {
             crate::play_acestream_with_playerid(p_id, 4000, 5);
         });
     }
@@ -64,14 +72,21 @@ mod android {
 // compile with: cargo lipo --release
 #[cfg(target_os = "ios")]
 mod ios {
-    use std::os::raw::{c_char};
-    use std::ffi::{CString, CStr};
-    #[no_mangle]
-    pub fn playacestream(player_id: *const c_char) {
+    use std::ffi::CStr;
+    use std::os::raw::c_char;
+
+    /// # Safety
+    /// `player_id` must be null or point to a valid NUL-terminated string.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn playacestream(player_id: *const c_char) {
+        if player_id.is_null() {
+            return;
+        }
         let c_str = unsafe { CStr::from_ptr(player_id) };
         if let Ok(p_id) = c_str.to_str() {
-            std::thread::spawn(move|| {
-                crate::play_acestream_with_playerid(p_id.to_string(), 4000, 5);
+            let p_id = p_id.to_owned();
+            std::thread::spawn(move || {
+                crate::play_acestream_with_playerid(p_id, 4000, 5);
             });
         }
     }
