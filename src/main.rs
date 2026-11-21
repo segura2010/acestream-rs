@@ -1,8 +1,11 @@
 use acelib::acestream::{bittorrent, utils};
 use acelib::server;
 
-const VERSION: &str = "0.1";
-const HELP: &str = "acestream-rs 0.1
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const HELP: &str = concat!(
+    "acestream-rs ",
+    env!("CARGO_PKG_VERSION"),
+    "
 
 USAGE:
     acestream-rs [FLAGS] [OPTIONS]
@@ -17,7 +20,8 @@ OPTIONS:
     -p <playerid>          Player ID/Content ID
     -P <port>              Output server port
     -t <torrent>           Torrent file
-    -w <workers>           Number of workers (threads) to download video";
+    -w <workers>           Number of workers (threads) to download video"
+);
 
 struct Options {
     torrent: String,
